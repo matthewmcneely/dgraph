@@ -61,6 +61,8 @@ type Options struct {
 
 	// feature flags
 	NormalizeCompatibilityMode string
+	// QueryDebugEnabled writes all queries/mutations with timing and uid stats to dgraph.debug.* predicates.
+	QueryDebugEnabled bool
 }
 
 // Config stores the global instance of this package's options.

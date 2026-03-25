@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dgraph Query Debug Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .scrollable { scrollbar-width: thin; scrollbar-color: #4b5563 #1f2937; }
+    .scrollable::-webkit-scrollbar { width: 6px; }
+    .scrollable::-webkit-scrollbar-track { background: #1f2937; }
+    .scrollable::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+    .sort-asc::after { content: ' ▲'; font-size: 0.65em; }
+    .sort-desc::after { content: ' ▼'; font-size: 0.65em; }
+    pre.query-text { white-space: pre-wrap; word-break: break-word; }
+    /* context menu */
+    .ctx-menu { position: fixed; z-index: 50; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-200 h-screen flex flex-col overflow-hidden">
+
+  <!-- Header -->
+  <header class="flex items-center justify-between px-5 py-3 bg-gray-900 border-b border-gray-800 shrink-0">
+    <h1 class="text-lg font-semibold tracking-tight text-white">Dgraph Query Debug</h1>
+    <div class="flex items-center gap-3">
+      <label class="text-xs text-gray-400">Alpha</label>
+      <input id="alphaUrl" type="text" value="http://localhost:8080"
+        class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm w-56 focus:outline-none focus:border-blue-500" />
+      <label class="text-xs text-gray-400">Limit</label>
+      <input id="queryLimit" type="number" value="200" min="1" max="10000"
+        class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm w-20 focus:outline-none focus:border-blue-500" />
+      <button onclick="fetchDebugEntries()"
+        class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-4 py-1.5 rounded transition">
+        Fetch
+      </button>
+      <span id="statusBadge" class="text-xs text-gray-500"></span>
+    </div>
+  </header>
+
+  <!-- Main two-column layout -->
+  <div class="flex flex-1 overflow-hidden">
+
+    <!-- Left panel: list -->
+    <div class="w-[55%] flex flex-col border-r border-gray-800 overflow-hidden">
+      <!-- Filter bar -->
+      <div class="px-3 py-2 bg-gray-900 border-b border-gray-800 flex items-center gap-2 shrink-0 flex-wrap">
+        <svg class="w-4 h-4 text-gray-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+        </svg>
+        <input id="filterInput" type="text" placeholder="Filter queries (e.g. 'has' or 'func:type')"
+          class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-500 min-w-[120px]"
+          oninput="applyFilter()" />
+        <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer select-none">
+          <input type="checkbox" id="filterExclude" onchange="applyFilter()" class="rounded" />
+          Exclude
+        </label>
+        <div class="border-l border-gray-700 h-4 mx-1"></div>
+        <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer select-none">
+          <input type="checkbox" id="groupToggle" onchange="applyFilter()" class="rounded" />
+          Group
+        </label>
+        <span id="countBadge" class="text-xs text-gray-500 ml-1"></span>
+      </div>
+
+      <!-- Hidden queries chips -->
+      <div id="hiddenBar" class="hidden px-3 py-1.5 bg-gray-900/80 border-b border-gray-800 flex items-center gap-1.5 flex-wrap shrink-0">
+        <span class="text-xs text-gray-500 mr-1">Hidden:</span>
+      </div>
+
+      <!-- Table header -->
+      <div id="tableHeader" class="text-xs font-medium text-gray-400 uppercase tracking-wider px-3 py-1.5 bg-gray-900 border-b border-gray-800 shrink-0 select-none"></div>
+
+      <!-- Rows -->
+      <div id="entryList" class="flex-1 overflow-y-auto scrollable"></div>
+    </div>
+
+    <!-- Right panel: detail -->
+    <div id="detailPanel" class="w-[45%] overflow-y-auto scrollable p-5">
+      <div class="text-gray-500 text-sm italic">Select a query from the list to view details.</div>
+    </div>
+  </div>
+
+  <!-- Context menu (hidden) -->
+  <div id="ctxMenu" class="ctx-menu hidden bg-gray-800 border border-gray-700 rounded shadow-xl py-1 min-w-[180px]"></div>
+
+  <script>
+    // ── State ──────────────────────────────────────────────
+    let allEntries = [];
+    let displayRows = [];  // after filter/group/sort — either entries or groups
+    let selectedUid = null;
+    let selectedGroupKey = null;
+    let sortField = 'total';
+    let sortDir = 'desc';
+    let hiddenQueries = new Set();  // normalized query strings to hide
+
+    // ── Fetch ─────────────────────────────────────────────
+    async function fetchDebugEntries() {
+      const url = document.getElementById('alphaUrl').value.replace(/\/+$/, '');
+      const limit = document.getElementById('queryLimit').value || 200;
+      const badge = document.getElementById('statusBadge');
+      badge.textContent = 'Loading…';
+      badge.className = 'text-xs text-yellow-400';
+
+      const dql = `{
+        ops(func: type(dgraph.debug.Operation), orderdesc: dgraph.debug.latency_total_ns, first: ${limit}) {
+          uid
+          dgraph.debug.query
+          dgraph.debug.variables
+          dgraph.debug.operation
+          dgraph.debug.timestamp
+          dgraph.debug.latency_total_ns
+          dgraph.debug.latency_parsing_ns
+          dgraph.debug.latency_processing_ns
+          dgraph.debug.latency_encoding_ns
+          dgraph.debug.latency_assign_ts_ns
+          dgraph.debug.uids_total
+          dgraph.debug.uid_metrics
+          dgraph.debug.disk_reads
+          dgraph.debug.cache_hits
+          dgraph.debug.cache_misses
+          dgraph.debug.error
+          dgraph.debug.namespace
+          dgraph.debug.trace_id
+        }
+      }`;
+
+      try {
+        const resp = await fetch(url + '/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/dql' },
+          body: dql,
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const json = await resp.json();
+        allEntries = (json.data?.ops || []).map(normalizeEntry);
+        badge.textContent = `${allEntries.length} entries`;
+        badge.className = 'text-xs text-green-400';
+        selectedUid = null;
+        selectedGroupKey = null;
+        applyFilter();
+      } catch (e) {
+        badge.textContent = e.message;
+        badge.className = 'text-xs text-red-400';
+      }
+    }
+
+    function normalizeEntry(e) {
+      return {
+        uid:        e.uid,
+        query:      e['dgraph.debug.query'] || '',
+        variables:  e['dgraph.debug.variables'] || '',
+        operation:  e['dgraph.debug.operation'] || '',
+        timestamp:  e['dgraph.debug.timestamp'] || '',
+        total:      e['dgraph.debug.latency_total_ns'] || 0,
+        parsing:    e['dgraph.debug.latency_parsing_ns'] || 0,
+        processing: e['dgraph.debug.latency_processing_ns'] || 0,
+        encoding:   e['dgraph.debug.latency_encoding_ns'] || 0,
+        assignTs:   e['dgraph.debug.latency_assign_ts_ns'] || 0,
+        uids:       e['dgraph.debug.uids_total'] || 0,
+        uidMetrics: e['dgraph.debug.uid_metrics'] || '',
+        diskReads:  e['dgraph.debug.disk_reads'] || 0,
+        cacheHits:  e['dgraph.debug.cache_hits'] || 0,
+        cacheMisses:e['dgraph.debug.cache_misses'] || 0,
+        error:      e['dgraph.debug.error'] || '',
+        namespace:  e['dgraph.debug.namespace'] || 0,
+        traceId:    e['dgraph.debug.trace_id'] || '',
+      };
+    }
+
+    // ── Normalize query for grouping (strip whitespace) ───
+    function queryKey(q) { return q.replace(/\s+/g, ' ').trim(); }
+
+    // ── Filter + Group + Sort pipeline ────────────────────
+    function applyFilter() {
+      const term = document.getElementById('filterInput').value.toLowerCase().trim();
+      const exclude = document.getElementById('filterExclude').checked;
+      const grouped = document.getElementById('groupToggle').checked;
+
+      // 1. Filter by search term
+      let entries = allEntries;
+      if (term) {
+        entries = entries.filter(e => {
+          const match = e.query.toLowerCase().includes(term);
+          return exclude ? !match : match;
+        });
+      }
+
+      // 2. Remove hidden queries
+      if (hiddenQueries.size > 0) {
+        entries = entries.filter(e => !hiddenQueries.has(queryKey(e.query)));
+      }
+
+      // 3. Group or flat
+      if (grouped) {
+        displayRows = buildGroups(entries);
+      } else {
+        displayRows = entries.map(e => ({ type: 'entry', data: e }));
+      }
+
+      // 4. Sort
+      sortDisplayRows();
+
+      // 5. Render
+      renderHeader(grouped);
+      renderList(grouped);
+      renderHiddenBar();
+
+      const totalAfterHidden = allEntries.length - [...hiddenQueries].reduce((n, hq) =>
+        n + allEntries.filter(e => queryKey(e.query) === hq).length, 0);
+      const shown = entries.length;
+      document.getElementById('countBadge').textContent =
+        shown < allEntries.length ? `${grouped ? displayRows.length + ' groups' : shown} / ${allEntries.length}` : '';
+    }
+
+    function buildGroups(entries) {
+      const map = new Map();
+      for (const e of entries) {
+        const key = queryKey(e.query);
+        if (!map.has(key)) {
+          map.set(key, { type: 'group', key, query: e.query, operation: e.operation, entries: [] });
+        }
+        map.get(key).entries.push(e);
+      }
+      // Compute aggregate stats
+      for (const g of map.values()) {
+        const n = g.entries.length;
+        g.count = n;
+        g.total    = Math.max(...g.entries.map(e => e.total));
+        g.avgTotal = g.entries.reduce((s, e) => s + e.total, 0) / n;
+        g.uids     = Math.max(...g.entries.map(e => e.uids));
+        g.diskReads  = g.entries.reduce((s, e) => s + e.diskReads, 0);
+        g.cacheHits  = g.entries.reduce((s, e) => s + e.cacheHits, 0);
+        g.cacheMisses = g.entries.reduce((s, e) => s + e.cacheMisses, 0);
+      }
+      return [...map.values()];
+    }
+
+    // ── Sort ──────────────────────────────────────────────
+    function toggleSort(field) {
+      if (sortField === field) {
+        sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        sortField = field;
+        sortDir = 'desc';
+      }
+      sortDisplayRows();
+      const grouped = document.getElementById('groupToggle').checked;
+      renderList(grouped);
+      updateSortIndicators();
+    }
+
+    function sortDisplayRows() {
+      const dir = sortDir === 'asc' ? 1 : -1;
+      const field = sortField;
+      displayRows.sort((a, b) => {
+        const ae = a.type === 'group' ? a : a.data;
+        const be = b.type === 'group' ? b : b.data;
+        const av = ae[field], bv = be[field];
+        if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
+        return String(av ?? '').localeCompare(String(bv ?? '')) * dir;
+      });
+    }
+
+    function updateSortIndicators() {
+      for (const f of ['query','operation','total','uids','diskReads','cacheHits','count']) {
+        const el = document.getElementById('sort-' + f);
+        if (el) el.className = sortField === f ? (sortDir === 'asc' ? 'sort-asc' : 'sort-desc') : '';
+      }
+    }
+
+    // ── Render table header ───────────────────────────────
+    function renderHeader(grouped) {
+      const hdr = document.getElementById('tableHeader');
+      if (grouped) {
+        hdr.innerHTML = `<div class="grid grid-cols-[1fr_60px_80px_90px_90px_70px_70px]">
+          <div class="cursor-pointer hover:text-white" onclick="toggleSort('query')">Query<span id="sort-query"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('count')">#<span id="sort-count"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('operation')">Op<span id="sort-operation"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('total')">Max<span id="sort-total"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('uids')">UIDs<span id="sort-uids"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('diskReads')">Disk<span id="sort-diskReads"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('cacheHits')">Cache<span id="sort-cacheHits"></span></div>
+        </div>`;
+      } else {
+        hdr.innerHTML = `<div class="grid grid-cols-[1fr_100px_90px_90px_70px_70px]">
+          <div class="cursor-pointer hover:text-white" onclick="toggleSort('query')">Query<span id="sort-query"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('operation')">Op<span id="sort-operation"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('total')">Total<span id="sort-total"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('uids')">UIDs<span id="sort-uids"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('diskReads')">Disk<span id="sort-diskReads"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('cacheHits')">Cache<span id="sort-cacheHits"></span></div>
+        </div>`;
+      }
+      updateSortIndicators();
+    }
+
+    // ── Render list ───────────────────────────────────────
+    function renderList(grouped) {
+      const container = document.getElementById('entryList');
+      if (displayRows.length === 0) {
+        container.innerHTML = '<div class="text-gray-500 text-sm p-4 italic">No entries found.</div>';
+        return;
+      }
+
+      const html = displayRows.map((row, idx) => {
+        if (row.type === 'group') return renderGroupRow(row, idx);
+        return renderEntryRow(row.data, idx);
+      }).join('');
+
+      container.innerHTML = html;
+    }
+
+    function renderEntryRow(e, idx) {
+      const selected = e.uid === selectedUid;
+      const preview = truncate(e.query.replace(/\s+/g, ' '), 80);
+      const bg = selected ? 'bg-blue-900/40 border-l-2 border-blue-500' : 'hover:bg-gray-800/60 border-l-2 border-transparent';
+      const opColor = e.operation === 'mutation' ? 'text-orange-400' : 'text-cyan-400';
+
+      return `<div class="grid grid-cols-[1fr_100px_90px_90px_70px_70px] px-3 py-1.5 text-sm cursor-pointer ${bg} border-b border-gray-800/50 transition-colors"
+                   onclick="selectEntry('${e.uid}')" oncontextmenu="showCtxMenu(event, ${idx})">
+        <div class="truncate font-mono text-xs text-gray-300" title="${esc(e.query)}">${esc(preview)}</div>
+        <div class="text-right ${opColor} text-xs">${e.operation}</div>
+        <div class="text-right font-mono text-xs ${latencyColor(e.total)}">${fmtDuration(e.total)}</div>
+        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(e.uids)}</div>
+        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(e.diskReads)}</div>
+        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(e.cacheHits)}</div>
+      </div>`;
+    }
+
+    function renderGroupRow(g, idx) {
+      const selected = g.key === selectedGroupKey;
+      const preview = truncate(g.query.replace(/\s+/g, ' '), 70);
+      const bg = selected ? 'bg-blue-900/40 border-l-2 border-blue-500' : 'hover:bg-gray-800/60 border-l-2 border-transparent';
+      const opColor = g.operation === 'mutation' ? 'text-orange-400' : 'text-cyan-400';
+
+      return `<div class="grid grid-cols-[1fr_60px_80px_90px_90px_70px_70px] px-3 py-1.5 text-sm cursor-pointer ${bg} border-b border-gray-800/50 transition-colors"
+                   onclick="selectGroup(${idx})" oncontextmenu="showCtxMenu(event, ${idx})">
+        <div class="truncate font-mono text-xs text-gray-300" title="${esc(g.query)}">${esc(preview)}</div>
+        <div class="text-right text-xs text-gray-400 font-semibold">${g.count}x</div>
+        <div class="text-right ${opColor} text-xs">${g.operation}</div>
+        <div class="text-right font-mono text-xs ${latencyColor(g.total)}">${fmtDuration(g.total)}</div>
+        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.uids)}</div>
+        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.diskReads)}</div>
+        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.cacheHits)}</div>
+      </div>`;
+    }
+
+    // ── Hidden queries bar ────────────────────────────────
+    function renderHiddenBar() {
+      const bar = document.getElementById('hiddenBar');
+      if (hiddenQueries.size === 0) {
+        bar.classList.add('hidden');
+        return;
+      }
+      bar.classList.remove('hidden');
+      const chips = [...hiddenQueries].map(q => {
+        const label = truncate(q, 40);
+        return `<span class="inline-flex items-center gap-1 bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-400 cursor-pointer hover:border-gray-500 transition" onclick="unhideQuery(this)" data-query="${esc(q)}" title="Click to unhide: ${esc(q)}">
+          ${esc(label)}
+          <svg class="w-3 h-3 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </span>`;
+      }).join('');
+      bar.innerHTML = `<span class="text-xs text-gray-500 mr-1 shrink-0">Hidden:</span>${chips}
+        <span class="text-xs text-gray-500 cursor-pointer hover:text-gray-300 ml-1 shrink-0" onclick="clearHidden()">Clear all</span>`;
+    }
+
+    function hideQuery(queryStr) {
+      hiddenQueries.add(queryKey(queryStr));
+      applyFilter();
+    }
+
+    function unhideQuery(el) {
+      hiddenQueries.delete(el.dataset.query);
+      applyFilter();
+    }
+
+    function clearHidden() {
+      hiddenQueries.clear();
+      applyFilter();
+    }
+
+    // ── Context menu ──────────────────────────────────────
+    function showCtxMenu(event, idx) {
+      event.preventDefault();
+      const row = displayRows[idx];
+      const q = row.type === 'group' ? row.query : row.data.query;
+      const key = queryKey(q);
+      const count = allEntries.filter(e => queryKey(e.query) === key).length;
+      const menu = document.getElementById('ctxMenu');
+
+      menu.innerHTML = `
+        <div class="px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-700 cursor-pointer" onclick="hideQuery(ctxMenuQuery); closeCtxMenu()">
+          Hide this query (${count} entr${count === 1 ? 'y' : 'ies'})
+        </div>
+        <div class="px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-700 cursor-pointer" onclick="copyQuery(ctxMenuQuery); closeCtxMenu()">
+          Copy query text
+        </div>`;
+
+      window.ctxMenuQuery = q;
+      menu.style.left = event.clientX + 'px';
+      menu.style.top = event.clientY + 'px';
+      menu.classList.remove('hidden');
+    }
+
+    function closeCtxMenu() { document.getElementById('ctxMenu').classList.add('hidden'); }
+    document.addEventListener('click', closeCtxMenu);
+
+    function copyQuery(q) { navigator.clipboard.writeText(q); }
+
+    // ── Select entry (flat mode) ──────────────────────────
+    function selectEntry(uid) {
+      selectedUid = uid;
+      selectedGroupKey = null;
+      const grouped = document.getElementById('groupToggle').checked;
+      renderList(grouped);
+      const e = allEntries.find(x => x.uid === uid);
+      if (!e) return;
+      renderDetail(e);
+    }
+
+    // ── Select group ──────────────────────────────────────
+    function selectGroup(idx) {
+      const g = displayRows[idx];
+      if (g.type !== 'group') return;
+      selectedGroupKey = g.key;
+      selectedUid = null;
+      renderList(true);
+      renderGroupDetail(g);
+    }
+
+    // ── Detail: single entry ──────────────────────────────
+    function renderDetail(e) {
+      const panel = document.getElementById('detailPanel');
+      panel.innerHTML = `
+        <div class="space-y-5">
+          <div class="flex items-center justify-between">
+            <div>
+              <span class="text-xs font-medium uppercase tracking-wider ${e.operation === 'mutation' ? 'text-orange-400' : 'text-cyan-400'}">${e.operation}</span>
+              <span class="text-xs text-gray-500 ml-3">${e.uid}</span>
+            </div>
+            <span class="text-xs text-gray-500">${fmtTimestamp(e.timestamp)}</span>
+          </div>
+
+          ${e.error ? `<div class="bg-red-900/30 border border-red-800 rounded px-3 py-2 text-sm text-red-300">${esc(e.error)}</div>` : ''}
+
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Query</h3>
+            <pre class="query-text bg-gray-900 rounded p-3 text-sm text-green-300 font-mono border border-gray-800 max-h-64 overflow-y-auto scrollable">${esc(e.query || '(empty)')}</pre>
+          </section>
+
+          ${e.variables ? `
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Variables</h3>
+            <pre class="query-text bg-gray-900 rounded p-3 text-sm text-yellow-300 font-mono border border-gray-800 max-h-40 overflow-y-auto scrollable">${fmtJson(e.variables)}</pre>
+          </section>` : ''}
+
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Latency</h3>
+            <div class="bg-gray-900 rounded border border-gray-800 p-3">
+              ${latencyBar(e)}
+              <div class="grid grid-cols-2 gap-x-6 gap-y-1 mt-3 text-sm">
+                ${statRow('Total', fmtDuration(e.total), latencyColor(e.total))}
+                ${statRow('Processing', fmtDuration(e.processing))}
+                ${statRow('Encoding', fmtDuration(e.encoding))}
+                ${statRow('Parsing', fmtDuration(e.parsing))}
+                ${statRow('Assign TS', fmtDuration(e.assignTs))}
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Statistics</h3>
+            <div class="grid grid-cols-2 gap-x-6 gap-y-1 text-sm bg-gray-900 rounded border border-gray-800 p-3">
+              ${statRow('UIDs Total', fmtNum(e.uids))}
+              ${statRow('Disk Reads', fmtNum(e.diskReads))}
+              ${statRow('Cache Hits', fmtNum(e.cacheHits))}
+              ${statRow('Cache Misses', fmtNum(e.cacheMisses))}
+              ${e.cacheHits + e.cacheMisses > 0 ? statRow('Cache Hit %', ((e.cacheHits / (e.cacheHits + e.cacheMisses)) * 100).toFixed(1) + '%') : ''}
+              ${statRow('Namespace', e.namespace)}
+              ${e.traceId ? statRow('Trace ID', `<span class="font-mono text-xs">${esc(e.traceId)}</span>`) : ''}
+            </div>
+          </section>
+
+          ${e.uidMetrics ? `
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">UID Metrics by Predicate</h3>
+            <div class="bg-gray-900 rounded border border-gray-800 p-3">
+              ${renderUidMetrics(e.uidMetrics)}
+            </div>
+          </section>` : ''}
+        </div>`;
+    }
+
+    // ── Detail: group ─────────────────────────────────────
+    function renderGroupDetail(g) {
+      const panel = document.getElementById('detailPanel');
+      const sorted = [...g.entries].sort((a, b) => b.total - a.total);
+      const avgTotal = g.entries.reduce((s, e) => s + e.total, 0) / g.count;
+      const minTotal = Math.min(...g.entries.map(e => e.total));
+      const p50 = percentile(g.entries.map(e => e.total), 50);
+      const p95 = percentile(g.entries.map(e => e.total), 95);
+      const p99 = percentile(g.entries.map(e => e.total), 99);
+
+      panel.innerHTML = `
+        <div class="space-y-5">
+          <div class="flex items-center justify-between">
+            <div>
+              <span class="text-xs font-medium uppercase tracking-wider ${g.operation === 'mutation' ? 'text-orange-400' : 'text-cyan-400'}">${g.operation}</span>
+              <span class="bg-gray-800 text-gray-300 text-xs font-semibold px-2 py-0.5 rounded ml-2">${g.count} executions</span>
+            </div>
+            <button class="text-xs text-gray-500 hover:text-red-400 transition" onclick="hideQuery(selectedGroupQuery)">Hide this query</button>
+          </div>
+
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Query</h3>
+            <pre class="query-text bg-gray-900 rounded p-3 text-sm text-green-300 font-mono border border-gray-800 max-h-64 overflow-y-auto scrollable">${esc(g.query)}</pre>
+          </section>
+
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Latency Distribution</h3>
+            <div class="bg-gray-900 rounded border border-gray-800 p-3">
+              <div class="grid grid-cols-2 gap-x-6 gap-y-1 text-sm">
+                ${statRow('Max', fmtDuration(g.total), latencyColor(g.total))}
+                ${statRow('p99', fmtDuration(p99), latencyColor(p99))}
+                ${statRow('p95', fmtDuration(p95), latencyColor(p95))}
+                ${statRow('p50 (median)', fmtDuration(p50), latencyColor(p50))}
+                ${statRow('Avg', fmtDuration(Math.round(avgTotal)), latencyColor(avgTotal))}
+                ${statRow('Min', fmtDuration(minTotal), latencyColor(minTotal))}
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Aggregate Statistics</h3>
+            <div class="grid grid-cols-2 gap-x-6 gap-y-1 text-sm bg-gray-900 rounded border border-gray-800 p-3">
+              ${statRow('Total Disk Reads', fmtNum(g.diskReads))}
+              ${statRow('Total Cache Hits', fmtNum(g.cacheHits))}
+              ${statRow('Total Cache Misses', fmtNum(g.cacheMisses))}
+              ${g.cacheHits + g.cacheMisses > 0 ? statRow('Cache Hit %', ((g.cacheHits / (g.cacheHits + g.cacheMisses)) * 100).toFixed(1) + '%') : ''}
+            </div>
+          </section>
+
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Individual Executions</h3>
+            <div class="space-y-1 max-h-80 overflow-y-auto scrollable">
+              ${sorted.map(e => `
+                <div class="flex items-center justify-between bg-gray-900 rounded px-3 py-1.5 border border-gray-800/50 text-xs cursor-pointer hover:bg-gray-800 transition" onclick="selectEntry('${e.uid}')">
+                  <span class="text-gray-500">${fmtTimestamp(e.timestamp)}</span>
+                  <div class="flex items-center gap-4">
+                    <span class="text-gray-400">UIDs ${fmtNum(e.uids)}</span>
+                    <span class="font-mono ${latencyColor(e.total)}">${fmtDuration(e.total)}</span>
+                  </div>
+                </div>`).join('')}
+            </div>
+          </section>
+        </div>`;
+
+      window.selectedGroupQuery = g.query;
+    }
+
+    function percentile(arr, p) {
+      const sorted = [...arr].sort((a, b) => a - b);
+      const idx = Math.ceil((p / 100) * sorted.length) - 1;
+      return sorted[Math.max(0, idx)];
+    }
+
+    // ── Helpers ────────────────────────────────────────────
+    function fmtDuration(ns) {
+      if (ns >= 1e9) return (ns / 1e9).toFixed(2) + 's';
+      if (ns >= 1e6) return (ns / 1e6).toFixed(2) + 'ms';
+      if (ns >= 1e3) return (ns / 1e3).toFixed(1) + 'µs';
+      return ns + 'ns';
+    }
+
+    function fmtNum(n) {
+      if (n === 0) return '0';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(n);
+    }
+
+    function fmtTimestamp(ts) {
+      if (!ts) return '';
+      try { return new Date(ts).toLocaleString(); } catch { return ts; }
+    }
+
+    function fmtJson(s) {
+      try { return esc(JSON.stringify(JSON.parse(s), null, 2)); } catch { return esc(s); }
+    }
+
+    function latencyColor(ns) {
+      if (ns >= 1e9) return 'text-red-400';
+      if (ns >= 100e6) return 'text-orange-400';
+      if (ns >= 10e6) return 'text-yellow-400';
+      return 'text-green-400';
+    }
+
+    function truncate(s, n) { return s.length > n ? s.slice(0, n) + '…' : s; }
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function statRow(label, value, valueClass) {
+      return `<div class="text-gray-400">${label}</div><div class="text-right font-mono ${valueClass || 'text-gray-200'}">${value}</div>`;
+    }
+
+    function latencyBar(e) {
+      const total = e.total || 1;
+      const segs = [
+        { label: 'Parsing',    ns: e.parsing,    color: 'bg-blue-500' },
+        { label: 'Assign TS',  ns: e.assignTs,   color: 'bg-purple-500' },
+        { label: 'Processing', ns: e.processing,  color: 'bg-emerald-500' },
+        { label: 'Encoding',   ns: e.encoding,   color: 'bg-amber-500' },
+      ];
+      const accounted = segs.reduce((s, x) => s + x.ns, 0);
+      if (accounted < total) {
+        segs.push({ label: 'Other', ns: total - accounted, color: 'bg-gray-600' });
+      }
+      const bars = segs
+        .filter(s => s.ns > 0)
+        .map(s => {
+          const pct = Math.max((s.ns / total) * 100, 0.5);
+          return `<div class="${s.color} h-full rounded-sm" style="width:${pct}%" title="${s.label}: ${fmtDuration(s.ns)}"></div>`;
+        }).join('');
+      return `<div class="flex h-3 rounded overflow-hidden gap-px bg-gray-800">${bars}</div>
+        <div class="flex gap-3 mt-1.5 text-xs text-gray-500">
+          ${segs.filter(s => s.ns > 0).map(s => `<span class="flex items-center gap-1"><span class="inline-block w-2 h-2 rounded-sm ${s.color}"></span>${s.label}</span>`).join('')}
+        </div>`;
+    }
+
+    function renderUidMetrics(jsonStr) {
+      try {
+        const m = JSON.parse(jsonStr);
+        const entries = Object.entries(m)
+          .filter(([k]) => k !== '_total')
+          .sort((a, b) => b[1] - a[1]);
+        if (entries.length === 0) return '<div class="text-gray-500 text-sm">No per-predicate metrics.</div>';
+        return `<table class="w-full text-sm">
+          <thead><tr class="text-xs text-gray-500 uppercase"><th class="text-left pb-1">Predicate</th><th class="text-right pb-1">UIDs</th></tr></thead>
+          <tbody>${entries.map(([k, v]) =>
+            `<tr class="border-t border-gray-800/50"><td class="font-mono text-gray-300 py-0.5">${esc(k)}</td><td class="text-right font-mono text-gray-400">${fmtNum(v)}</td></tr>`
+          ).join('')}</tbody>
+        </table>`;
+      } catch {
+        return `<pre class="text-xs text-gray-400">${esc(jsonStr)}</pre>`;
+      }
+    }
+
+    // ── Keyboard shortcuts ────────────────────────────────
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        closeCtxMenu();
+        document.getElementById('filterInput').value = '';
+        applyFilter();
+      }
+    });
+
+    // Init
+    renderHeader(false);
+    updateSortIndicators();
+  </script>
+</body>
+</html>

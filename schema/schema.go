@@ -694,6 +694,32 @@ func initialTypesInternal(namespace uint64, all bool) []*pb.TypeUpdate {
 			})
 	}
 
+	if all || x.Config.QueryDebugEnabled {
+		initialTypes = append(initialTypes,
+			&pb.TypeUpdate{
+				TypeName: "dgraph.debug.Operation",
+				Fields: []*pb.SchemaUpdate{
+					{Predicate: "dgraph.debug.query", ValueType: pb.Posting_STRING},
+					{Predicate: "dgraph.debug.variables", ValueType: pb.Posting_STRING},
+					{Predicate: "dgraph.debug.operation", ValueType: pb.Posting_STRING},
+					{Predicate: "dgraph.debug.timestamp", ValueType: pb.Posting_DATETIME},
+					{Predicate: "dgraph.debug.latency_total_ns", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.latency_parsing_ns", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.latency_processing_ns", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.latency_encoding_ns", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.latency_assign_ts_ns", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.uids_total", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.uid_metrics", ValueType: pb.Posting_STRING},
+					{Predicate: "dgraph.debug.disk_reads", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.cache_hits", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.cache_misses", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.error", ValueType: pb.Posting_STRING},
+					{Predicate: "dgraph.debug.namespace", ValueType: pb.Posting_INT},
+					{Predicate: "dgraph.debug.trace_id", ValueType: pb.Posting_STRING},
+				},
+			})
+	}
+
 	if all || x.WorkerConfig.AclEnabled {
 		// These type definitions are required for deleteUser and deleteGroup GraphQL API to work
 		// properly.
@@ -819,6 +845,91 @@ func initialSchemaInternal(namespace uint64, all bool) []*pb.SchemaUpdate {
 				Tokenizer: []string{"int"},
 				Unique:    true,
 				Upsert:    true,
+			},
+		}...)
+	}
+
+	if all || x.Config.QueryDebugEnabled {
+		initialSchema = append(initialSchema, []*pb.SchemaUpdate{
+			{
+				Predicate: "dgraph.debug.query",
+				ValueType: pb.Posting_STRING,
+				Directive: pb.SchemaUpdate_INDEX,
+				Tokenizer: []string{"hash"},
+			},
+			{
+				Predicate: "dgraph.debug.variables",
+				ValueType: pb.Posting_STRING,
+			},
+			{
+				Predicate: "dgraph.debug.operation",
+				ValueType: pb.Posting_STRING,
+				Directive: pb.SchemaUpdate_INDEX,
+				Tokenizer: []string{"exact"},
+			},
+			{
+				Predicate: "dgraph.debug.timestamp",
+				ValueType: pb.Posting_DATETIME,
+				Directive: pb.SchemaUpdate_INDEX,
+				Tokenizer: []string{"hour"},
+			},
+			{
+				Predicate: "dgraph.debug.latency_total_ns",
+				ValueType: pb.Posting_INT,
+				Directive: pb.SchemaUpdate_INDEX,
+				Tokenizer: []string{"int"},
+			},
+			{
+				Predicate: "dgraph.debug.latency_parsing_ns",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.latency_processing_ns",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.latency_encoding_ns",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.latency_assign_ts_ns",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.uids_total",
+				ValueType: pb.Posting_INT,
+				Directive: pb.SchemaUpdate_INDEX,
+				Tokenizer: []string{"int"},
+			},
+			{
+				Predicate: "dgraph.debug.uid_metrics",
+				ValueType: pb.Posting_STRING,
+			},
+			{
+				Predicate: "dgraph.debug.disk_reads",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.cache_hits",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.cache_misses",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.error",
+				ValueType: pb.Posting_STRING,
+			},
+			{
+				Predicate: "dgraph.debug.namespace",
+				ValueType: pb.Posting_INT,
+			},
+			{
+				Predicate: "dgraph.debug.trace_id",
+				ValueType: pb.Posting_STRING,
+				Directive: pb.SchemaUpdate_INDEX,
+				Tokenizer: []string{"exact"},
 			},
 		}...)
 	}

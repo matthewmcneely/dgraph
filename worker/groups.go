@@ -188,8 +188,11 @@ func (g *groupi) informZeroAboutTablets() {
 func (g *groupi) applyInitialTypes() {
 	initialTypes := schema.InitialTypes(x.RootNamespace)
 	for _, t := range initialTypes {
-		if _, ok := schema.State().GetType(t.TypeName); ok {
-			continue
+		if existing, ok := schema.State().GetType(t.TypeName); ok {
+			// Update the type if it has changed (e.g. new fields added).
+			if proto.Equal(&existing, t) {
+				continue
+			}
 		}
 		// It is okay to write initial types at ts=1.
 		if err := updateType(t.GetTypeName(), t, 1); err != nil {

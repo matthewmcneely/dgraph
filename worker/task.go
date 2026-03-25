@@ -1057,6 +1057,10 @@ func processTask(ctx context.Context, q *pb.Query, gid uint32) (*pb.Result, erro
 	if qs.cache == nil {
 		qs.cache = posting.NoCache(q.ReadTs)
 	}
+	// Attach per-query stats collector if present in context.
+	if stats := x.QueryStatsFrom(ctx); stats != nil {
+		qs.cache.SetQueryStats(stats)
+	}
 	// For now, remove the query level cache. It is causing contention for queries with high
 	// fan-out.
 	out, err := qs.helpProcessTask(ctx, q, gid)

@@ -274,6 +274,10 @@ they form a Raft group and provide synchronous replication.
 			"with structured fields including trace ID for correlation with distributed traces. "+
 			"Disabled by default (0). Note: enabling this logs query text which may contain "+
 			"sensitive data; do not enable in deployments with strict data privacy requirements.").
+		Flag("enable-query-debug", "Write all queries and mutations with detailed timing and "+
+			"uid_visited statistics to dgraph.debug.* predicates in the graph. Query text is stored "+
+			"separately from variables/args so identical queries can be identified regardless of "+
+			"arguments. Disabled by default.").
 		String())
 }
 
@@ -796,6 +800,7 @@ func run() {
 	x.Config.NormalizeCompatibilityMode = featureFlagsConf.GetString("normalize-compatibility-mode")
 	enableDetailedMetrics := featureFlagsConf.GetBool("enable-detailed-metrics")
 	x.WorkerConfig.SlowQueryLogThreshold = featureFlagsConf.GetDuration("log-slow-query-threshold")
+	x.Config.QueryDebugEnabled = featureFlagsConf.GetBool("enable-query-debug")
 
 	x.PrintVersion()
 	glog.Infof("x.Config: %+v", x.Config)
@@ -816,6 +821,17 @@ func run() {
 	// schema before calling posting.Init().
 	schema.Init(worker.State.Pstore)
 	posting.Init(worker.State.Pstore, postingListCacheSize, removeOnUpdate)
+	// When query debug is enabled, also enable detailed metrics so per-predicate
+	// disk read and cache OpenCensus data is available alongside per-query debug entries.
+	if x.Config.QueryDebugEnabled {
+		glog.Infof("enable-query-debug is on; dgraph.debug.* predicates will be written for " +
+			"every query and mutation. Query the debug data with: " +
+			"{ ops(func: type(dgraph.debug.Operation), orderdesc: dgraph.debug.latency_total_ns, first: 10) { ... } }")
+		if !enableDetailedMetrics {
+			glog.Infof("enable-query-debug is on; auto-enabling enable-detailed-metrics")
+			enableDetailedMetrics = true
+		}
+	}
 	posting.SetEnabledDetailedMetrics(enableDetailedMetrics)
 	defer posting.Cleanup()
 

@@ -664,6 +664,34 @@ var internalPredicateMap = map[string]struct{}{
 	"uid": {},
 }
 
+// Debug predicates for query/mutation performance tracking.
+// Written when the enable-query-debug feature flag is on.
+var debugPredicateMap = map[string]struct{}{
+	"dgraph.debug.query":                 {},
+	"dgraph.debug.variables":             {},
+	"dgraph.debug.operation":             {},
+	"dgraph.debug.timestamp":             {},
+	"dgraph.debug.latency_total_ns":      {},
+	"dgraph.debug.latency_parsing_ns":    {},
+	"dgraph.debug.latency_processing_ns": {},
+	"dgraph.debug.latency_encoding_ns":   {},
+	"dgraph.debug.latency_assign_ts_ns":  {},
+	"dgraph.debug.uids_total":            {},
+	"dgraph.debug.uid_metrics":           {},
+	"dgraph.debug.disk_reads":            {},
+	"dgraph.debug.cache_hits":            {},
+	"dgraph.debug.cache_misses":          {},
+	"dgraph.debug.error":                 {},
+	"dgraph.debug.namespace":             {},
+	"dgraph.debug.trace_id":              {},
+}
+
+// IsDebugPredicate returns true if the predicate is a debug performance tracking predicate.
+func IsDebugPredicate(pred string) bool {
+	_, ok := debugPredicateMap[ParseAttr(pred)]
+	return ok
+}
+
 var preDefinedTypeMap = map[string]struct{}{
 	"dgraph.graphql":                 {},
 	"dgraph.type.User":               {},
@@ -671,6 +699,7 @@ var preDefinedTypeMap = map[string]struct{}{
 	"dgraph.type.Rule":               {},
 	"dgraph.graphql.persisted_query": {},
 	"dgraph.namespace":               {},
+	"dgraph.debug.Operation":         {},
 }
 
 // IsOtherReservedPredicate returns true if it is the predicate is reserved by graphql.
@@ -715,7 +744,7 @@ func IsReservedPredicate(pred string) bool {
 func IsPreDefinedPredicate(pred string) bool {
 	pred = ParseAttr(pred)
 	_, ok := starAllPredicateMap[strings.ToLower(pred)]
-	return ok || IsAclPredicate(pred) || IsOtherReservedPredicate(pred)
+	return ok || IsAclPredicate(pred) || IsOtherReservedPredicate(pred) || IsDebugPredicate(pred)
 }
 
 // IsAclPredicate returns true if the predicate is in the list of reserved
