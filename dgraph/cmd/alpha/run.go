@@ -545,6 +545,7 @@ func setupServer(closer *z.Closer, enableMcp bool) {
 	baseMux.HandleFunc("/alter", alterHandler)
 	baseMux.HandleFunc("/health", healthCheck)
 	baseMux.HandleFunc("/state", stateHandler)
+	baseMux.HandleFunc("/debug-ui", debugUIHandler)
 	baseMux.HandleFunc("/debug/jemalloc", x.JemallocHandler)
 	http.DefaultServeMux.Handle("/debug/z", zpages.NewTracezHandler(zpages.NewSpanProcessor()))
 

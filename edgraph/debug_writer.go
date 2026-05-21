@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang/glog"
@@ -22,6 +23,7 @@ import (
 // debugEntry holds the data for a single debug operation record.
 type debugEntry struct {
 	Query     string
+	Mutation  string // serialized mutation body (set/delete NQuads)
 	Variables string
 	Operation string // "query" or "mutation"
 	Timestamp time.Time
@@ -31,10 +33,11 @@ type debugEntry struct {
 	Namespace uint64
 	TraceID   string
 
-	// Detailed metrics from posting layer (populated when enable-detailed-metrics is also on).
-	DiskReads   int64
-	CacheHits   int64
-	CacheMisses int64
+	// Cache metrics across all layers (PL cache + badger block/index cache).
+	DiskReads    int64
+	CacheHits    int64 // total hits across all cache layers
+	CacheMisses  int64 // total misses across all cache layers
+	CacheHitRate float64
 }
 
 // writeDebugEntry writes a debug operation record to the dgraph.debug.* predicates.
@@ -59,6 +62,16 @@ func writeDebugEntry(ctx context.Context, entry *debugEntry) {
 			Val: &api.Value_StrVal{StrVal: entry.Query},
 		},
 	})
+
+	if entry.Mutation != "" {
+		nquads = append(nquads, &api.NQuad{
+			Subject:   blank,
+			Predicate: "dgraph.debug.mutation",
+			ObjectValue: &api.Value{
+				Val: &api.Value_StrVal{StrVal: entry.Mutation},
+			},
+		})
+	}
 
 	if entry.Variables != "" {
 		nquads = append(nquads, &api.NQuad{
@@ -113,7 +126,7 @@ func writeDebugEntry(ctx context.Context, entry *debugEntry) {
 		}
 	}
 
-	// Detailed posting-layer metrics (disk reads, cache hits/misses).
+	// Cache metrics across all layers.
 	nquads = append(nquads, intNQuad(blank, "dgraph.debug.disk_reads", entry.DiskReads))
 	nquads = append(nquads, intNQuad(blank, "dgraph.debug.cache_hits", entry.CacheHits))
 	nquads = append(nquads, intNQuad(blank, "dgraph.debug.cache_misses", entry.CacheMisses))
@@ -158,6 +171,57 @@ func writeDebugEntry(ctx context.Context, entry *debugEntry) {
 	}
 }
 
+// summarizeMutations produces a readable summary of mutation set/delete NQuads.
+func summarizeMutations(mutations []*api.Mutation) string {
+	var b strings.Builder
+	for i, mu := range mutations {
+		if i > 0 {
+			b.WriteString("\n---\n")
+		}
+		if mu.Cond != "" {
+			fmt.Fprintf(&b, "cond: %s\n", mu.Cond)
+		}
+		if len(mu.SetNquads) > 0 {
+			fmt.Fprintf(&b, "set {\n%s}\n", string(mu.SetNquads))
+		}
+		if len(mu.DelNquads) > 0 {
+			fmt.Fprintf(&b, "delete {\n%s}\n", string(mu.DelNquads))
+		}
+		for _, nq := range mu.Set {
+			fmt.Fprintf(&b, "set { <%s> <%s> ", nq.Subject, nq.Predicate)
+			if nq.ObjectId != "" {
+				fmt.Fprintf(&b, "<%s>", nq.ObjectId)
+			} else {
+				fmt.Fprintf(&b, "%q", nq.ObjectValue)
+			}
+			b.WriteString(" . }\n")
+		}
+		for _, nq := range mu.Del {
+			fmt.Fprintf(&b, "delete { <%s> <%s> ", nq.Subject, nq.Predicate)
+			if nq.ObjectId != "" {
+				fmt.Fprintf(&b, "<%s>", nq.ObjectId)
+			} else if nq.ObjectValue != nil {
+				fmt.Fprintf(&b, "%q", nq.ObjectValue)
+			} else {
+				b.WriteString("*")
+			}
+			b.WriteString(" . }\n")
+		}
+		if mu.SetJson != nil {
+			fmt.Fprintf(&b, "setJson: %s\n", string(mu.SetJson))
+		}
+		if mu.DeleteJson != nil {
+			fmt.Fprintf(&b, "deleteJson: %s\n", string(mu.DeleteJson))
+		}
+	}
+	s := b.String()
+	// Truncate very large mutations to avoid bloating the debug store.
+	if len(s) > 4096 {
+		return s[:4096] + "\n...[truncated]"
+	}
+	return s
+}
+
 // intNQuad builds an NQuad with an integer value.
 func intNQuad(subject, predicate string, val int64) *api.NQuad {
 	return &api.NQuad{
@@ -198,6 +262,7 @@ func maybeWriteDebugEntry(ctx context.Context, req *api.Request, l *query.Latenc
 
 	if len(req.Mutations) > 0 {
 		entry.Operation = "mutation"
+		entry.Mutation = summarizeMutations(req.Mutations)
 	} else {
 		entry.Operation = "query"
 	}
@@ -219,11 +284,12 @@ func maybeWriteDebugEntry(ctx context.Context, req *api.Request, l *query.Latenc
 		entry.TraceID = span.SpanContext().TraceID().String()
 	}
 
-	// Capture detailed posting-layer metrics from the per-query stats collector.
+	// Capture unified cache metrics from the per-query stats collector.
 	if stats != nil {
 		entry.DiskReads = stats.DiskReads.Load()
-		entry.CacheHits = stats.CacheHits.Load()
-		entry.CacheMisses = stats.CacheMisses.Load()
+		entry.CacheHits = stats.TotalCacheHits()
+		entry.CacheMisses = stats.TotalCacheMisses()
+		entry.CacheHitRate = stats.CacheHitRate()
 	}
 
 	go writeDebugEntry(ctx, entry)
@@ -252,6 +318,7 @@ func FormatDebugQuery(limit int) string {
   slow_queries(func: type(dgraph.debug.Operation), orderdesc: dgraph.debug.latency_total_ns, first: %d) {
     uid
     dgraph.debug.query
+    dgraph.debug.mutation
     dgraph.debug.variables
     dgraph.debug.operation
     dgraph.debug.timestamp

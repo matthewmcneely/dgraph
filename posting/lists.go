@@ -146,6 +146,15 @@ func (lc *LocalCache) SetQueryStats(qs *x.QueryStats) {
 	lc.queryStats = qs
 }
 
+// getNewTracked calls into the MemoryLayer with stats tracking when queryStats is set,
+// otherwise falls back to the standard getNew path.
+func (lc *LocalCache) getNewTracked(key []byte, readUids bool) (*List, error) {
+	if lc.queryStats != nil {
+		return MemLayerInstance.ReadDataTracked(key, pstore, lc.startTs, readUids, lc.queryStats)
+	}
+	return getNew(key, pstore, lc.startTs, readUids)
+}
+
 // NoCache returns a new LocalCache instance, which won't cache anything. Useful to pass startTs
 // around.
 func NoCache(startTs uint64) *LocalCache {
@@ -269,15 +278,9 @@ func (lc *LocalCache) getInternal(key []byte, readFromDisk, readUids bool) (*Lis
 		lc.RLock()
 		defer lc.RUnlock()
 		if lc.plists == nil {
-			if lc.queryStats != nil {
-				lc.queryStats.DiskReads.Add(1)
-			}
-			return getNew(key, pstore, lc.startTs, readUids)
+			return lc.getNewTracked(key, readUids)
 		}
 		if l, ok := lc.plists[skey]; ok {
-			if lc.queryStats != nil {
-				lc.queryStats.CacheHits.Add(1)
-			}
 			return l, nil
 		}
 		return nil, nil
@@ -289,12 +292,8 @@ func (lc *LocalCache) getInternal(key []byte, readFromDisk, readUids bool) (*Lis
 
 	var pl *List
 	if readFromDisk {
-		if lc.queryStats != nil {
-			lc.queryStats.DiskReads.Add(1)
-			lc.queryStats.CacheMisses.Add(1)
-		}
 		var err error
-		pl, err = getNew(key, pstore, lc.startTs, readUids)
+		pl, err = lc.getNewTracked(key, readUids)
 		if err != nil {
 			return nil, err
 		}
@@ -317,8 +316,11 @@ func (lc *LocalCache) getInternal(key []byte, readFromDisk, readUids bool) (*Lis
 }
 
 func (lc *LocalCache) readPostingListAt(key []byte) (*pb.PostingList, error) {
+	// This reads directly from badger, bypassing the MemoryLayer posting list cache.
+	// Badger's own block/index cache may still serve these reads from memory.
 	if lc.queryStats != nil {
 		lc.queryStats.DiskReads.Add(1)
+		lc.queryStats.PLCacheBypass.Add(1)
 	}
 	if EnableDetailedMetrics {
 		start := time.Now()
@@ -377,15 +379,9 @@ func (lc *LocalCache) GetSinglePosting(key []byte) (*pb.PostingList, error) {
 		// If both pl and err are empty, that means that there was no data in local cache, hence we should
 		// read the data from badger.
 		if pl != nil || err != nil {
-			if lc.queryStats != nil && pl != nil {
-				lc.queryStats.CacheHits.Add(1)
-			}
 			return pl, err
 		}
 
-		if lc.queryStats != nil {
-			lc.queryStats.CacheMisses.Add(1)
-		}
 		return lc.readPostingListAt(key)
 	}
 

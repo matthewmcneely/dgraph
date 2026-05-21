@@ -668,6 +668,7 @@ var internalPredicateMap = map[string]struct{}{
 // Written when the enable-query-debug feature flag is on.
 var debugPredicateMap = map[string]struct{}{
 	"dgraph.debug.query":                 {},
+	"dgraph.debug.mutation":              {},
 	"dgraph.debug.variables":             {},
 	"dgraph.debug.operation":             {},
 	"dgraph.debug.timestamp":             {},

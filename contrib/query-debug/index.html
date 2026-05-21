@@ -33,6 +33,10 @@
         class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-4 py-1.5 rounded transition">
         Fetch
       </button>
+      <button onclick="clearAllDebugHistory()"
+        class="bg-red-700 hover:bg-red-600 text-white text-sm font-medium px-4 py-1.5 rounded transition">
+        Clear All
+      </button>
       <span id="statusBadge" class="text-xs text-gray-500"></span>
     </div>
   </header>
@@ -48,7 +52,7 @@
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
             d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
         </svg>
-        <input id="filterInput" type="text" placeholder="Filter queries (e.g. 'has' or 'func:type')"
+        <input id="filterInput" type="text" placeholder="Filter: allAcls AND uid(1), &quot;exact phrase&quot;, NOT schema, (a OR b) AND c"
           class="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-500 min-w-[120px]"
           oninput="applyFilter()" />
         <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer select-none">
@@ -103,9 +107,10 @@
       badge.className = 'text-xs text-yellow-400';
 
       const dql = `{
-        ops(func: type(dgraph.debug.Operation), orderdesc: dgraph.debug.latency_total_ns, first: ${limit}) {
+        ops(func: type(dgraph.debug.Operation), orderdesc: dgraph.debug.timestamp, first: ${limit}) {
           uid
           dgraph.debug.query
+          dgraph.debug.mutation
           dgraph.debug.variables
           dgraph.debug.operation
           dgraph.debug.timestamp
@@ -145,10 +150,58 @@
       }
     }
 
+    async function clearAllDebugHistory() {
+      if (!confirm('Delete all debug history entries? This cannot be undone.')) return;
+      const url = document.getElementById('alphaUrl').value.replace(/\/+$/, '');
+      const badge = document.getElementById('statusBadge');
+      badge.textContent = 'Clearing…';
+      badge.className = 'text-xs text-yellow-400';
+
+      try {
+        // Query all debug entry UIDs
+        const findResp = await fetch(url + '/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/dql' },
+          body: '{ ops(func: type(dgraph.debug.Operation)) { uid } }',
+        });
+        if (!findResp.ok) throw new Error(`Query failed: HTTP ${findResp.status}`);
+        const findJson = await findResp.json();
+        const uids = (findJson.data?.ops || []).map(n => n.uid);
+
+        if (uids.length === 0) {
+          badge.textContent = 'Nothing to clear';
+          badge.className = 'text-xs text-gray-400';
+          return;
+        }
+
+        // Delete all nodes by UID using JSON mutation
+        const delBody = uids.map(uid => ({ uid }));
+        const mutResp = await fetch(url + '/mutate?commitNow=true', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ delete: delBody }),
+        });
+        if (!mutResp.ok) throw new Error(`Mutate failed: HTTP ${mutResp.status}`);
+
+        allEntries = [];
+        selectedUid = null;
+        selectedGroupKey = null;
+        applyFilter();
+        document.getElementById('detailPanel').innerHTML =
+          '<div class="text-gray-500 text-sm italic">Select a query from the list to view details.</div>';
+        badge.textContent = `Cleared ${uids.length} entries`;
+        badge.className = 'text-xs text-green-400';
+      } catch (e) {
+        badge.textContent = e.message;
+        badge.className = 'text-xs text-red-400';
+      }
+    }
+
     function normalizeEntry(e) {
       return {
         uid:        e.uid,
         query:      e['dgraph.debug.query'] || '',
+        mutation:   e['dgraph.debug.mutation'] || '',
         variables:  e['dgraph.debug.variables'] || '',
         operation:  e['dgraph.debug.operation'] || '',
         timestamp:  e['dgraph.debug.timestamp'] || '',
@@ -162,6 +215,10 @@
         diskReads:  e['dgraph.debug.disk_reads'] || 0,
         cacheHits:  e['dgraph.debug.cache_hits'] || 0,
         cacheMisses:e['dgraph.debug.cache_misses'] || 0,
+        get cacheRate() {
+          const t = this.cacheHits + this.cacheMisses;
+          return t > 0 ? (this.cacheHits / t) * 100 : -1; // -1 = no data
+        },
         error:      e['dgraph.debug.error'] || '',
         namespace:  e['dgraph.debug.namespace'] || 0,
         traceId:    e['dgraph.debug.trace_id'] || '',
@@ -171,17 +228,122 @@
     // ── Normalize query for grouping (strip whitespace) ───
     function queryKey(q) { return q.replace(/\s+/g, ' ').trim(); }
 
+    // ── Boolean filter expression parser ──────────────────
+    // Supports: AND, OR, NOT, parentheses, "quoted phrases", bare terms.
+    // Examples:
+    //   allAcls AND uid(1)
+    //   "func: eq" OR mutation
+    //   NOT uid(1)
+    //   (allAcls OR schema) AND NOT uid(1)
+    // Bare terms without operators are implicitly ANDed.
+
+    function parseFilterExpr(input) {
+      const tokens = tokenizeFilter(input);
+      if (tokens.length === 0) return null;
+      const ctx = { tokens, pos: 0 };
+      const expr = parseOr(ctx);
+      return expr;
+    }
+
+    function tokenizeFilter(input) {
+      const tokens = [];
+      let i = 0;
+      while (i < input.length) {
+        if (input[i] === ' ' || input[i] === '\t') { i++; continue; }
+        if (input[i] === '(') { tokens.push({ type: 'LPAREN' }); i++; continue; }
+        if (input[i] === ')') { tokens.push({ type: 'RPAREN' }); i++; continue; }
+        if (input[i] === '"') {
+          const end = input.indexOf('"', i + 1);
+          const str = end === -1 ? input.slice(i + 1) : input.slice(i + 1, end);
+          tokens.push({ type: 'TERM', value: str.toLowerCase() });
+          i = end === -1 ? input.length : end + 1;
+          continue;
+        }
+        // Read a word
+        let j = i;
+        while (j < input.length && !' \t()\"'.includes(input[j])) j++;
+        const word = input.slice(i, j);
+        const upper = word.toUpperCase();
+        if (upper === 'AND') tokens.push({ type: 'AND' });
+        else if (upper === 'OR') tokens.push({ type: 'OR' });
+        else if (upper === 'NOT') tokens.push({ type: 'NOT' });
+        else tokens.push({ type: 'TERM', value: word.toLowerCase() });
+        i = j;
+      }
+      return tokens;
+    }
+
+    function peek(ctx) { return ctx.pos < ctx.tokens.length ? ctx.tokens[ctx.pos] : null; }
+    function consume(ctx) { return ctx.tokens[ctx.pos++]; }
+
+    // Grammar: or = and (OR and)*
+    function parseOr(ctx) {
+      let left = parseAnd(ctx);
+      while (peek(ctx)?.type === 'OR') {
+        consume(ctx);
+        const right = parseAnd(ctx);
+        left = { op: 'OR', left, right };
+      }
+      return left;
+    }
+
+    // Grammar: and = unary ((AND)? unary)*
+    // Implicit AND: two terms without an operator
+    function parseAnd(ctx) {
+      let left = parseUnary(ctx);
+      while (peek(ctx) && peek(ctx).type !== 'OR' && peek(ctx).type !== 'RPAREN') {
+        if (peek(ctx).type === 'AND') consume(ctx);
+        const right = parseUnary(ctx);
+        left = { op: 'AND', left, right };
+      }
+      return left;
+    }
+
+    // Grammar: unary = NOT unary | atom
+    function parseUnary(ctx) {
+      if (peek(ctx)?.type === 'NOT') {
+        consume(ctx);
+        return { op: 'NOT', child: parseUnary(ctx) };
+      }
+      return parseAtom(ctx);
+    }
+
+    // Grammar: atom = LPAREN or RPAREN | TERM
+    function parseAtom(ctx) {
+      if (peek(ctx)?.type === 'LPAREN') {
+        consume(ctx);
+        const expr = parseOr(ctx);
+        if (peek(ctx)?.type === 'RPAREN') consume(ctx);
+        return expr;
+      }
+      const tok = consume(ctx);
+      if (tok?.type === 'TERM') return { op: 'TERM', value: tok.value };
+      return { op: 'TERM', value: '' }; // fallback
+    }
+
+    function evalFilter(expr, text) {
+      if (!expr) return true;
+      switch (expr.op) {
+        case 'TERM':  return text.includes(expr.value);
+        case 'AND':   return evalFilter(expr.left, text) && evalFilter(expr.right, text);
+        case 'OR':    return evalFilter(expr.left, text) || evalFilter(expr.right, text);
+        case 'NOT':   return !evalFilter(expr.child, text);
+        default:      return true;
+      }
+    }
+
     // ── Filter + Group + Sort pipeline ────────────────────
     function applyFilter() {
-      const term = document.getElementById('filterInput').value.toLowerCase().trim();
+      const raw = document.getElementById('filterInput').value.trim();
       const exclude = document.getElementById('filterExclude').checked;
       const grouped = document.getElementById('groupToggle').checked;
 
-      // 1. Filter by search term
+      // 1. Filter by expression
       let entries = allEntries;
-      if (term) {
+      const expr = parseFilterExpr(raw);
+      if (expr) {
         entries = entries.filter(e => {
-          const match = e.query.toLowerCase().includes(term);
+          const match = evalFilter(expr, e.query.toLowerCase());
           return exclude ? !match : match;
         });
       }
@@ -226,12 +388,15 @@
       for (const g of map.values()) {
         const n = g.entries.length;
         g.count = n;
+        g.lastTimestamp = g.entries.reduce((latest, e) => e.timestamp > latest ? e.timestamp : latest, '');
         g.total    = Math.max(...g.entries.map(e => e.total));
         g.avgTotal = g.entries.reduce((s, e) => s + e.total, 0) / n;
         g.uids     = Math.max(...g.entries.map(e => e.uids));
         g.diskReads  = g.entries.reduce((s, e) => s + e.diskReads, 0);
         g.cacheHits  = g.entries.reduce((s, e) => s + e.cacheHits, 0);
         g.cacheMisses = g.entries.reduce((s, e) => s + e.cacheMisses, 0);
+        const totalLookups = g.cacheHits + g.cacheMisses;
+        g.cacheRate = totalLookups > 0 ? (g.cacheHits / totalLookups) * 100 : -1;
       }
       return [...map.values()];
     }
@@ -263,7 +428,7 @@
     }
 
     function updateSortIndicators() {
-      for (const f of ['query','operation','total','uids','diskReads','cacheHits','count']) {
+      for (const f of ['query','operation','timestamp','total','uids','diskReads','cacheRate','count']) {
         const el = document.getElementById('sort-' + f);
         if (el) el.className = sortField === f ? (sortDir === 'asc' ? 'sort-asc' : 'sort-desc') : '';
       }
@@ -273,23 +438,25 @@
     function renderHeader(grouped) {
       const hdr = document.getElementById('tableHeader');
       if (grouped) {
-        hdr.innerHTML = `<div class="grid grid-cols-[1fr_60px_80px_90px_90px_70px_70px]">
+        hdr.innerHTML = `<div class="grid grid-cols-[1fr_60px_80px_130px_90px_90px_70px_70px]">
           <div class="cursor-pointer hover:text-white" onclick="toggleSort('query')">Query<span id="sort-query"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('count')">#<span id="sort-count"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('operation')">Op<span id="sort-operation"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('timestamp')">Time<span id="sort-timestamp"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('total')">Max<span id="sort-total"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('uids')">UIDs<span id="sort-uids"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('diskReads')">Disk<span id="sort-diskReads"></span></div>
-          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('cacheHits')">Cache<span id="sort-cacheHits"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('cacheRate')">Cache %<span id="sort-cacheRate"></span></div>
         </div>`;
       } else {
-        hdr.innerHTML = `<div class="grid grid-cols-[1fr_100px_90px_90px_70px_70px]">
+        hdr.innerHTML = `<div class="grid grid-cols-[1fr_100px_130px_90px_90px_70px_70px]">
           <div class="cursor-pointer hover:text-white" onclick="toggleSort('query')">Query<span id="sort-query"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('operation')">Op<span id="sort-operation"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('timestamp')">Time<span id="sort-timestamp"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('total')">Total<span id="sort-total"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('uids')">UIDs<span id="sort-uids"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('diskReads')">Disk<span id="sort-diskReads"></span></div>
-          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('cacheHits')">Cache<span id="sort-cacheHits"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('cacheRate')">Cache %<span id="sort-cacheRate"></span></div>
         </div>`;
       }
       updateSortIndicators();
@@ -317,14 +484,15 @@
       const bg = selected ? 'bg-blue-900/40 border-l-2 border-blue-500' : 'hover:bg-gray-800/60 border-l-2 border-transparent';
       const opColor = e.operation === 'mutation' ? 'text-orange-400' : 'text-cyan-400';
 
-      return `<div class="grid grid-cols-[1fr_100px_90px_90px_70px_70px] px-3 py-1.5 text-sm cursor-pointer ${bg} border-b border-gray-800/50 transition-colors"
+      return `<div class="grid grid-cols-[1fr_100px_130px_90px_90px_70px_70px] px-3 py-1.5 text-sm cursor-pointer ${bg} border-b border-gray-800/50 transition-colors"
                    onclick="selectEntry('${e.uid}')" oncontextmenu="showCtxMenu(event, ${idx})">
         <div class="truncate font-mono text-xs text-gray-300" title="${esc(e.query)}">${esc(preview)}</div>
         <div class="text-right ${opColor} text-xs">${e.operation}</div>
+        <div class="text-right text-xs text-gray-500">${fmtShortTime(e.timestamp)}</div>
         <div class="text-right font-mono text-xs ${latencyColor(e.total)}">${fmtDuration(e.total)}</div>
         <div class="text-right font-mono text-xs text-gray-400">${fmtNum(e.uids)}</div>
         <div class="text-right font-mono text-xs text-gray-400">${fmtNum(e.diskReads)}</div>
-        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(e.cacheHits)}</div>
+        <div class="text-right font-mono text-xs ${cacheRateColor(e.cacheRate)}">${fmtCacheRate(e.cacheRate)}</div>
       </div>`;
     }
 
@@ -334,15 +502,16 @@
       const bg = selected ? 'bg-blue-900/40 border-l-2 border-blue-500' : 'hover:bg-gray-800/60 border-l-2 border-transparent';
       const opColor = g.operation === 'mutation' ? 'text-orange-400' : 'text-cyan-400';
 
-      return `<div class="grid grid-cols-[1fr_60px_80px_90px_90px_70px_70px] px-3 py-1.5 text-sm cursor-pointer ${bg} border-b border-gray-800/50 transition-colors"
+      return `<div class="grid grid-cols-[1fr_60px_80px_130px_90px_90px_70px_70px] px-3 py-1.5 text-sm cursor-pointer ${bg} border-b border-gray-800/50 transition-colors"
                    onclick="selectGroup(${idx})" oncontextmenu="showCtxMenu(event, ${idx})">
         <div class="truncate font-mono text-xs text-gray-300" title="${esc(g.query)}">${esc(preview)}</div>
         <div class="text-right text-xs text-gray-400 font-semibold">${g.count}x</div>
         <div class="text-right ${opColor} text-xs">${g.operation}</div>
+        <div class="text-right text-xs text-gray-500">${fmtShortTime(g.lastTimestamp)}</div>
         <div class="text-right font-mono text-xs ${latencyColor(g.total)}">${fmtDuration(g.total)}</div>
         <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.uids)}</div>
         <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.diskReads)}</div>
-        <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.cacheHits)}</div>
+        <div class="text-right font-mono text-xs ${cacheRateColor(g.cacheRate)}">${fmtCacheRate(g.cacheRate)}</div>
       </div>`;
     }
 
@@ -408,6 +577,204 @@
 
     function copyQuery(q) { navigator.clipboard.writeText(q); }
 
+    // ── Copy for AI ─────────────────────────────────────
+    async function copyForAI(uid) {
+      const e = allEntries.find(x => x.uid === uid);
+      if (!e) return;
+
+      const btn = event.target.closest('button');
+      const orig = btn.innerHTML;
+      btn.innerHTML = '<svg class="w-3.5 h-3.5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg> Fetching…';
+      btn.disabled = true;
+
+      try {
+        const [schemaText, typeCountsText] = await Promise.all([
+          fetchSchemaForAI(),
+          fetchTypeCountsForAI(),
+        ]);
+
+        const text = buildAIPrompt(e, schemaText, typeCountsText);
+        await navigator.clipboard.writeText(text.trim());
+
+        btn.innerHTML = '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg> Copied!';
+        btn.classList.add('text-green-400', 'border-green-700');
+        setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('text-green-400', 'border-green-700'); btn.disabled = false; }, 1500);
+      } catch (err) {
+        btn.innerHTML = 'Error';
+        btn.classList.add('text-red-400', 'border-red-700');
+        setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('text-red-400', 'border-red-700'); btn.disabled = false; }, 2000);
+        console.error('copyForAI failed:', err);
+      }
+    }
+
+    async function fetchSchemaForAI() {
+      const url = document.getElementById('alphaUrl').value.replace(/\/+$/, '');
+      const resp = await fetch(url + '/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/dql' },
+        body: 'schema {}',
+      });
+      const json = await resp.json();
+      const preds = json.data?.schema || [];
+      if (preds.length === 0) return '(no schema found)';
+
+      // Format as DQL-style schema lines, skip dgraph.debug.* predicates
+      const lines = preds
+        .filter(p => !p.predicate.startsWith('dgraph.debug.'))
+        .sort((a, b) => a.predicate.localeCompare(b.predicate))
+        .map(p => {
+          let line = `${p.predicate}: ${p.type}`;
+          const directives = [];
+          if (p.list) line = `[${line}]`;
+          if (p.index && p.tokenizer) directives.push(`@index(${p.tokenizer.join(', ')})`);
+          if (p.reverse) directives.push('@reverse');
+          if (p.count) directives.push('@count');
+          if (p.upsert) directives.push('@upsert');
+          if (p.unique) directives.push('@unique');
+          if (p.lang) directives.push('@lang');
+          if (directives.length) line += ' ' + directives.join(' ');
+          return line + ' .';
+        });
+      return lines.join('\n');
+    }
+
+    async function fetchTypeCountsForAI() {
+      const url = document.getElementById('alphaUrl').value.replace(/\/+$/, '');
+
+      // First get all type names
+      const typesResp = await fetch(url + '/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/dql' },
+        body: 'schema { type }',
+      });
+      const typesJson = await typesResp.json();
+      const types = (typesJson.data?.types || [])
+        .map(t => t.name)
+        .filter(n => !n.startsWith('dgraph.debug.'));
+
+      if (types.length === 0) return '(no types found)';
+
+      // Batch count queries, 50 types per request
+      const batchSize = 50;
+      const counts = {};
+      for (let i = 0; i < types.length; i += batchSize) {
+        const batch = types.slice(i, i + batchSize);
+        // Sanitize type names for use as DQL aliases (replace non-alphanumeric with _)
+        const blocks = batch.map((t, j) => {
+          const alias = 'T' + (i + j);
+          return `${alias}(func: type(${t})) { count(uid) }`;
+        });
+        const dql = '{ ' + blocks.join('\n') + ' }';
+
+        const resp = await fetch(url + '/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/dql' },
+          body: dql,
+        });
+        const json = await resp.json();
+        if (json.data) {
+          batch.forEach((t, j) => {
+            const alias = 'T' + (i + j);
+            const result = json.data[alias];
+            counts[t] = result?.[0]?.count ?? 0;
+          });
+        }
+      }
+
+      // Format as table, sorted by count descending, skip zeros
+      const rows = Object.entries(counts)
+        .filter(([, v]) => v > 0)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `  ${k.padEnd(45)} ${v.toLocaleString()}`);
+
+      if (rows.length === 0) return '(all types have 0 nodes)';
+
+      const zeroCount = Object.values(counts).filter(v => v === 0).length;
+      let result = rows.join('\n');
+      if (zeroCount > 0) {
+        result += `\n  ... and ${zeroCount} types with 0 nodes`;
+      }
+      return result;
+    }
+
+    function buildAIPrompt(e, schemaText, typeCountsText) {
+      let uidMetricsTable = '';
+      if (e.uidMetrics) {
+        try {
+          const m = JSON.parse(e.uidMetrics);
+          const rows = Object.entries(m)
+            .filter(([k]) => k !== '_total')
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => `  ${(k || '(root)').padEnd(40)} ${v}`);
+          uidMetricsTable = rows.join('\n');
+        } catch { uidMetricsTable = e.uidMetrics; }
+      }
+
+      return `I have a Dgraph DQL ${e.operation} that I'd like help optimizing. Below are the query details, performance metrics, the database schema, and node counts by type — all captured from a live system.
+
+## DQL ${e.operation.charAt(0).toUpperCase() + e.operation.slice(1)}
+
+\`\`\`dql
+${e.query || '(no query text)'}
+\`\`\`
+${e.mutation ? `
+## Mutation Body
+
+\`\`\`
+${e.mutation}
+\`\`\`
+` : ''}${e.variables ? `
+## Variables
+
+\`\`\`json
+${(() => { try { return JSON.stringify(JSON.parse(e.variables), null, 2); } catch { return e.variables; } })()}
+\`\`\`
+` : ''}
+## Performance Metrics
+
+| Metric | Value |
+|--------|-------|
+| Total Latency | ${fmtDuration(e.total)} |
+| Processing | ${fmtDuration(e.processing)} |
+| Encoding | ${fmtDuration(e.encoding)} |
+| Parsing | ${fmtDuration(e.parsing)} |
+| Assign Timestamp | ${fmtDuration(e.assignTs)} |
+| UIDs Visited | ${e.uids.toLocaleString()} |
+| Disk Reads | ${e.diskReads.toLocaleString()} |
+| Cache Hits | ${e.cacheHits.toLocaleString()} |
+| Cache Misses | ${e.cacheMisses.toLocaleString()} |
+| Cache Hit Rate | ${e.cacheRate >= 0 ? e.cacheRate.toFixed(1) + '%' : 'N/A'} |
+${e.error ? `| Error | ${e.error} |\n` : ''}${uidMetricsTable ? `
+## UIDs Visited by Predicate
+
+\`\`\`
+${uidMetricsTable}
+\`\`\`
+` : ''}
+## Database Schema
+
+\`\`\`dql
+${schemaText}
+\`\`\`
+
+## Node Counts by Type
+
+\`\`\`
+${typeCountsText}
+\`\`\`
+
+## Goals
+
+Please analyze this ${e.operation} and suggest optimizations to reduce latency and resource usage. Consider:
+- Query structure and whether predicates can be reduced or reordered
+- Index usage and whether additional or different indexes would help (refer to the schema above)
+- Filter placement (pushing filters closer to the root to reduce fan-out)
+- Whether the query visits too many UIDs relative to the data size (refer to type counts above)
+- Caching effectiveness (${e.cacheRate >= 0 ? e.cacheRate.toFixed(0) + '% hit rate' : 'no cache data'})
+- Any anti-patterns in the DQL
+`;
+    }
+
     // ── Select entry (flat mode) ──────────────────────────
     function selectEntry(uid) {
       selectedUid = uid;
@@ -439,7 +806,13 @@
               <span class="text-xs font-medium uppercase tracking-wider ${e.operation === 'mutation' ? 'text-orange-400' : 'text-cyan-400'}">${e.operation}</span>
               <span class="text-xs text-gray-500 ml-3">${e.uid}</span>
             </div>
-            <span class="text-xs text-gray-500">${fmtTimestamp(e.timestamp)}</span>
+            <div class="flex items-center gap-3">
+              <button onclick="copyForAI('${e.uid}')" class="text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded px-2.5 py-1 transition flex items-center gap-1.5" title="Copy query details formatted for AI optimization">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                Copy for AI
+              </button>
+              <span class="text-xs text-gray-500">${fmtTimestamp(e.timestamp)}</span>
+            </div>
           </div>
 
           ${e.error ? `<div class="bg-red-900/30 border border-red-800 rounded px-3 py-2 text-sm text-red-300">${esc(e.error)}</div>` : ''}
@@ -448,6 +821,12 @@
             <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Query</h3>
             <pre class="query-text bg-gray-900 rounded p-3 text-sm text-green-300 font-mono border border-gray-800 max-h-64 overflow-y-auto scrollable">${esc(e.query || '(empty)')}</pre>
           </section>
+
+          ${e.mutation ? `
+          <section>
+            <h3 class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Mutation</h3>
+            <pre class="query-text bg-gray-900 rounded p-3 text-sm text-orange-300 font-mono border border-gray-800 max-h-64 overflow-y-auto scrollable">${esc(e.mutation)}</pre>
+          </section>` : ''}
 
           ${e.variables ? `
           <section>
@@ -476,7 +855,7 @@
               ${statRow('Disk Reads', fmtNum(e.diskReads))}
               ${statRow('Cache Hits', fmtNum(e.cacheHits))}
               ${statRow('Cache Misses', fmtNum(e.cacheMisses))}
-              ${e.cacheHits + e.cacheMisses > 0 ? statRow('Cache Hit %', ((e.cacheHits / (e.cacheHits + e.cacheMisses)) * 100).toFixed(1) + '%') : ''}
+              ${e.cacheRate >= 0 ? statRow('Cache Hit Rate', `<span class="${cacheRateColor(e.cacheRate)}">${e.cacheRate.toFixed(1)}%</span>`) : ''}
               ${statRow('Namespace', e.namespace)}
               ${e.traceId ? statRow('Trace ID', `<span class="font-mono text-xs">${esc(e.traceId)}</span>`) : ''}
             </div>
@@ -537,7 +916,7 @@
               ${statRow('Total Disk Reads', fmtNum(g.diskReads))}
               ${statRow('Total Cache Hits', fmtNum(g.cacheHits))}
               ${statRow('Total Cache Misses', fmtNum(g.cacheMisses))}
-              ${g.cacheHits + g.cacheMisses > 0 ? statRow('Cache Hit %', ((g.cacheHits / (g.cacheHits + g.cacheMisses)) * 100).toFixed(1) + '%') : ''}
+              ${g.cacheRate >= 0 ? statRow('Cache Hit Rate', `<span class="${cacheRateColor(g.cacheRate)}">${g.cacheRate.toFixed(1)}%</span>`) : ''}
             </div>
           </section>
 
@@ -585,6 +964,14 @@
       try { return new Date(ts).toLocaleString(); } catch { return ts; }
     }
 
+    function fmtShortTime(ts) {
+      if (!ts) return '';
+      try {
+        const d = new Date(ts);
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      } catch { return ts; }
+    }
+
     function fmtJson(s) {
       try { return esc(JSON.stringify(JSON.parse(s), null, 2)); } catch { return esc(s); }
     }
@@ -594,6 +981,19 @@
       if (ns >= 100e6) return 'text-orange-400';
       if (ns >= 10e6) return 'text-yellow-400';
       return 'text-green-400';
+    }
+
+    function fmtCacheRate(rate) {
+      if (rate < 0) return '-';
+      return rate.toFixed(0) + '%';
+    }
+
+    function cacheRateColor(rate) {
+      if (rate < 0) return 'text-gray-600';
+      if (rate >= 80) return 'text-green-400';
+      if (rate >= 50) return 'text-yellow-400';
+      if (rate >= 20) return 'text-orange-400';
+      return 'text-red-400';
     }
 
     function truncate(s, n) { return s.length > n ? s.slice(0, n) + '…' : s; }
@@ -641,9 +1041,11 @@
         if (entries.length === 0) return '<div class="text-gray-500 text-sm">No per-predicate metrics.</div>';
         return `<table class="w-full text-sm">
           <thead><tr class="text-xs text-gray-500 uppercase"><th class="text-left pb-1">Predicate</th><th class="text-right pb-1">UIDs</th></tr></thead>
-          <tbody>${entries.map(([k, v]) =>
-            `<tr class="border-t border-gray-800/50"><td class="font-mono text-gray-300 py-0.5">${esc(k)}</td><td class="text-right font-mono text-gray-400">${fmtNum(v)}</td></tr>`
-          ).join('')}</tbody>
+          <tbody>${entries.map(([k, v]) => {
+            const name = k || '(root)';
+            const cls = k ? 'text-gray-300' : 'text-gray-500 italic';
+            return `<tr class="border-t border-gray-800/50"><td class="font-mono ${cls} py-0.5">${esc(name)}</td><td class="text-right font-mono text-gray-400">${fmtNum(v)}</td></tr>`;
+          }).join('')}</tbody>
         </table>`;
       } catch {
         return `<pre class="text-xs text-gray-400">${esc(jsonStr)}</pre>`;

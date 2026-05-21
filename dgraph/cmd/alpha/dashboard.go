@@ -6,11 +6,20 @@
 package alpha
 
 import (
+	_ "embed"
 	"encoding/json"
 	"net/http"
 
 	"github.com/dgraph-io/dgraph/v25/x"
 )
+
+//go:embed debug_ui.html
+var debugUIHTML []byte
+
+func debugUIHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	x.Check2(w.Write(debugUIHTML))
+}
 
 type keyword struct {
 	// Type could be a predicate, function etc.

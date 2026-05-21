@@ -1357,6 +1357,24 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 	l := &query.Latency{}
 	l.Start = time.Now()
 
+	// Attach per-query stats collector when query debug is enabled.
+	// Snapshot badger cache counters before processing so we can compute per-query deltas.
+	var queryStats *x.QueryStats
+	var badgerBefore x.BadgerCacheSnapshot
+	if x.Config.QueryDebugEnabled {
+		ctx, queryStats = x.WithQueryStats(ctx)
+		if pstore := worker.State.Pstore; pstore != nil {
+			if bm := pstore.BlockCacheMetrics(); bm != nil {
+				badgerBefore.BlockHits = bm.Hits()
+				badgerBefore.BlockMisses = bm.Misses()
+			}
+			if im := pstore.IndexCacheMetrics(); im != nil {
+				badgerBefore.IndexHits = im.Hits()
+				badgerBefore.IndexMisses = im.Misses()
+			}
+		}
+	}
+
 	isMutation := len(req.req.Mutations) > 0
 	methodRequest := methodQuery
 	if isMutation {
@@ -1505,6 +1523,23 @@ func (s *Server) doQuery(ctx context.Context, req *Request) (resp *api.Response,
 		EncodingNs:        uint64(l.Json.Nanoseconds()),
 		TotalNs:           uint64((time.Since(l.Start)).Nanoseconds()),
 	}
+
+	// Compute per-query badger cache deltas before writing debug entry.
+	if queryStats != nil {
+		if pstore := worker.State.Pstore; pstore != nil {
+			if bm := pstore.BlockCacheMetrics(); bm != nil {
+				queryStats.BadgerBlockHits = bm.Hits() - badgerBefore.BlockHits
+				queryStats.BadgerBlockMisses = bm.Misses() - badgerBefore.BlockMisses
+			}
+			if im := pstore.IndexCacheMetrics(); im != nil {
+				queryStats.BadgerIndexHits = im.Hits() - badgerBefore.IndexHits
+				queryStats.BadgerIndexMisses = im.Misses() - badgerBefore.IndexMisses
+			}
+		}
+	}
+
+	// Write query debug entry if enabled.
+	maybeWriteDebugEntry(ctx, req.req, l, resp, gqlErrs, queryStats)
 
 	return resp, gqlErrs
 }

@@ -1,0 +1,88 @@
+#
+# Custom Makefile for building debug Dgraph image
+# Usage:
+#   make -f Makefile.matthew build           # Build image (host arch only)
+#   make -f Makefile.matthew build-multiarch # Build and push multi-arch image (arm64+amd64)
+#   make -f Makefile.matthew push            # Push single-arch image to Docker Hub
+#   make -f Makefile.matthew all             # Build and push (single-arch)
+#
+# Prerequisites for multi-arch:
+#   brew install messense/macos-cross-toolchains/x86_64-unknown-linux-gnu
+#   brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
+
+IMAGE_NAME    := matthewmcneely/dgraph-debug
+IMAGE_TAG     ?= latest
+
+GOHOSTOS      := $(shell go env GOHOSTOS)
+GOHOSTARCH    := $(shell go env GOHOSTARCH)
+export GOPATH ?= $(shell go env GOPATH)
+
+DEBUG_UI_SRC  := contrib/query-debug/index.html
+DEBUG_UI_DEST := dgraph/cmd/alpha/debug_ui.html
+
+ARM64_CC      ?= aarch64-unknown-linux-gnu-gcc
+AMD64_CC      ?= x86_64-unknown-linux-gnu-gcc
+
+ifeq ($(GOHOSTOS),linux)
+    LINUX_CC ?= gcc
+else
+    ifeq ($(GOHOSTARCH),arm64)
+        LINUX_CC ?= $(ARM64_CC)
+    else ifeq ($(GOHOSTARCH),amd64)
+        LINUX_CC ?= $(AMD64_CC)
+    else
+        LINUX_CC ?= gcc
+    endif
+endif
+
+.PHONY: all build build-multiarch push clean embed-debug-ui
+
+all: build push
+
+embed-debug-ui: ## Copy debug UI HTML into alpha package for go:embed
+	@echo "Embedding debug UI..."
+	@cp $(DEBUG_UI_SRC) $(DEBUG_UI_DEST)
+
+build: embed-debug-ui ## Build dgraph binary and Docker image (host arch only)
+	@echo "Building dgraph binary (linux/$(GOHOSTARCH))..."
+ifeq ($(GOHOSTOS),linux)
+	@GOOS=linux GOARCH=$(GOHOSTARCH) $(MAKE) -f Makefile dgraph
+else
+	@GOOS=linux GOARCH=$(GOHOSTARCH) CGO_ENABLED=1 CC=$(LINUX_CC) $(MAKE) -f Makefile BUILD_TAGS= EXTLDFLAGS=-fuse-ld=bfd dgraph
+endif
+	@mkdir -p linux
+	@mv ./dgraph/dgraph ./linux/dgraph
+	@echo "Building Docker image $(IMAGE_NAME):$(IMAGE_TAG)..."
+	@docker build -f contrib/Dockerfile -t $(IMAGE_NAME):$(IMAGE_TAG) .
+	@rm -rf linux
+
+build-multiarch: embed-debug-ui ## Build and push multi-arch image (arm64 + amd64)
+	@echo "Building dgraph binaries (arm64 + amd64) in parallel..."
+	@mkdir -p linux-arm64 linux-amd64
+	@( \
+		GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC=$(ARM64_CC) $(MAKE) -f Makefile BUILD_TAGS= EXTLDFLAGS=-fuse-ld=bfd dgraph \
+		&& mv ./dgraph/dgraph ./linux-arm64/dgraph \
+		&& echo "  arm64 done" \
+	) & \
+	( \
+		GOOS=linux GOARCH=amd64 CGO_ENABLED=1 CC=$(AMD64_CC) $(MAKE) -f Makefile BUILD_TAGS= EXTLDFLAGS=-fuse-ld=bfd dgraph \
+		&& mv ./dgraph/dgraph ./linux-amd64/dgraph \
+		&& echo "  amd64 done" \
+	) & \
+	wait
+	@echo "Building and pushing multi-arch Docker image $(IMAGE_NAME):$(IMAGE_TAG)..."
+	@docker buildx build \
+		-f contrib/Dockerfile.multiarch \
+		--platform linux/arm64,linux/amd64 \
+		-t $(IMAGE_NAME):$(IMAGE_TAG) \
+		--output=type=registry .
+	@rm -rf linux-arm64 linux-amd64
+
+push: ## Push single-arch image to Docker Hub
+	@echo "Pushing $(IMAGE_NAME):$(IMAGE_TAG) to Docker Hub..."
+	@docker push $(IMAGE_NAME):$(IMAGE_TAG)
+
+clean: ## Remove local image and embedded assets
+	@docker rmi $(IMAGE_NAME):$(IMAGE_TAG) 2>/dev/null || true
+	@rm -rf linux linux-arm64 linux-amd64
+	@rm -f $(DEBUG_UI_DEST)

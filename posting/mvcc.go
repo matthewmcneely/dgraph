@@ -838,6 +838,35 @@ func (ml *MemoryLayer) ReadData(key []byte, pstore *badger.DB, readTs uint64, re
 	return l, nil
 }
 
+// ReadDataTracked works like ReadData but records cache hit/miss/disk read stats.
+func (ml *MemoryLayer) ReadDataTracked(key []byte, pstore *badger.DB, readTs uint64, readUids bool, qs *x.QueryStats) (*List, error) {
+	l := ml.readFromCache(key, readTs)
+	if l != nil {
+		l.mutationMap.setTs(readTs)
+		qs.CacheHits.Add(1)
+		return l, nil
+	}
+	qs.CacheMisses.Add(1)
+	qs.DiskReads.Add(1)
+	l, err := ml.readFromDisk(key, pstore, math.MaxUint64, readUids)
+	if err != nil {
+		return nil, err
+	}
+	ml.saveInCache(key, l)
+	if l.minTs == 0 || readTs >= l.minTs {
+		l.mutationMap.setTs(readTs)
+		return l, nil
+	}
+
+	qs.DiskReads.Add(1)
+	l, err = ml.readFromDisk(key, pstore, readTs, readUids)
+	if err != nil {
+		return nil, err
+	}
+	l.mutationMap.setTs(readTs)
+	return l, nil
+}
+
 func GetNew(key []byte, pstore *badger.DB, readTs uint64, readUids bool) (*List, error) {
 	return getNew(key, pstore, readTs, readUids)
 }

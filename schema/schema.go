@@ -700,6 +700,7 @@ func initialTypesInternal(namespace uint64, all bool) []*pb.TypeUpdate {
 				TypeName: "dgraph.debug.Operation",
 				Fields: []*pb.SchemaUpdate{
 					{Predicate: "dgraph.debug.query", ValueType: pb.Posting_STRING},
+					{Predicate: "dgraph.debug.mutation", ValueType: pb.Posting_STRING},
 					{Predicate: "dgraph.debug.variables", ValueType: pb.Posting_STRING},
 					{Predicate: "dgraph.debug.operation", ValueType: pb.Posting_STRING},
 					{Predicate: "dgraph.debug.timestamp", ValueType: pb.Posting_DATETIME},
@@ -856,6 +857,10 @@ func initialSchemaInternal(namespace uint64, all bool) []*pb.SchemaUpdate {
 				ValueType: pb.Posting_STRING,
 				Directive: pb.SchemaUpdate_INDEX,
 				Tokenizer: []string{"hash"},
+			},
+			{
+				Predicate: "dgraph.debug.mutation",
+				ValueType: pb.Posting_STRING,
 			},
 			{
 				Predicate: "dgraph.debug.variables",
