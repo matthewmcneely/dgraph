@@ -296,10 +296,10 @@ func maybeWriteDebugEntry(ctx context.Context, req *api.Request, l *query.Latenc
 }
 
 // isDebugInternalRequest returns true if the request is an internal debug write
-// to prevent infinite recursion.
+// or a query/mutation referencing debug logs, to prevent infinite recursion and noise.
 func isDebugInternalRequest(req *api.Request) bool {
 	if req.Query != "" {
-		return false
+		return strings.Contains(req.Query, "dgraph.debug")
 	}
 	for _, mu := range req.Mutations {
 		for _, nq := range mu.Set {
