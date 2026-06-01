@@ -22,13 +22,37 @@
   <!-- Header -->
   <header class="flex items-center justify-between px-5 py-3 bg-gray-900 border-b border-gray-800 shrink-0">
     <h1 class="text-lg font-semibold tracking-tight text-white">Dgraph Query Debug</h1>
-    <div class="flex items-center gap-3">
+    <div class="flex items-center gap-3 flex-wrap">
       <label class="text-xs text-gray-400">Alpha</label>
       <input id="alphaUrl" type="text" value="http://localhost:8080"
         class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm w-56 focus:outline-none focus:border-blue-500" />
-      <label class="text-xs text-gray-400">Limit</label>
-      <input id="queryLimit" type="number" value="200" min="1" max="10000"
-        class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm w-20 focus:outline-none focus:border-blue-500" />
+      
+      <label class="text-xs text-gray-400">Time Range</label>
+      <select id="timeRange" onchange="onTimeRangeChange()"
+        class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-500 text-gray-200">
+        <option value="all">All Time</option>
+        <option value="1m">Last Minute</option>
+        <option value="5m">Last 5 Minutes</option>
+        <option value="15m">Last 15 Minutes</option>
+        <option value="1h">Last Hour</option>
+        <option value="24h">Last 24 Hours</option>
+        <option value="custom">Custom Range</option>
+      </select>
+
+      <div id="customRangeInputs" class="hidden flex items-center gap-2">
+        <input id="customStart" type="datetime-local"
+          class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-500 text-gray-200" />
+        <span class="text-xs text-gray-500">to</span>
+        <input id="customEnd" type="datetime-local"
+          class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-500 text-gray-200" />
+      </div>
+
+      <div id="limitContainer" class="flex items-center gap-2">
+        <label class="text-xs text-gray-400">Limit</label>
+        <input id="queryLimit" type="number" value="200" min="1" max="10000"
+          class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm w-20 focus:outline-none focus:border-blue-500" />
+      </div>
+
       <button onclick="fetchDebugEntries()"
         class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium px-4 py-1.5 rounded transition">
         Fetch
@@ -98,16 +122,80 @@
     let sortDir = 'desc';
     let hiddenQueries = new Set();  // normalized query strings to hide
 
+    // ── Time range change event handler ───────────────────
+    function onTimeRangeChange() {
+      const val = document.getElementById('timeRange').value;
+      const customDiv = document.getElementById('customRangeInputs');
+      const limitDiv = document.getElementById('limitContainer');
+
+      if (val === 'custom') {
+        customDiv.classList.remove('hidden');
+        const now = new Date();
+        const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+        const formatLocal = (d) => {
+          const pad = (n) => String(n).padStart(2, '0');
+          return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        };
+        if (!document.getElementById('customStart').value) {
+          document.getElementById('customStart').value = formatLocal(oneHourAgo);
+        }
+        if (!document.getElementById('customEnd').value) {
+          document.getElementById('customEnd').value = formatLocal(now);
+        }
+      } else {
+        customDiv.classList.add('hidden');
+      }
+
+      if (val === 'all') {
+        limitDiv.classList.remove('hidden');
+      } else {
+        limitDiv.classList.add('hidden');
+      }
+    }
+
     // ── Fetch ─────────────────────────────────────────────
     async function fetchDebugEntries() {
       const url = document.getElementById('alphaUrl').value.replace(/\/+$/, '');
-      const limit = document.getElementById('queryLimit').value || 200;
       const badge = document.getElementById('statusBadge');
       badge.textContent = 'Loading…';
       badge.className = 'text-xs text-yellow-400';
 
+      const timeRange = document.getElementById('timeRange').value;
+      let filter = '';
+      let firstClause = '';
+
+      if (timeRange === 'all') {
+        const limit = document.getElementById('queryLimit').value || 200;
+        firstClause = `, first: ${limit}`;
+      } else if (timeRange === 'custom') {
+        const startVal = document.getElementById('customStart').value;
+        const endVal = document.getElementById('customEnd').value;
+        if (startVal && endVal) {
+          const startIso = new Date(startVal).toISOString();
+          const endIso = new Date(endVal).toISOString();
+          filter = `@filter(ge(dgraph.debug.timestamp, "${startIso}") AND le(dgraph.debug.timestamp, "${endIso}"))`;
+        } else if (startVal) {
+          const startIso = new Date(startVal).toISOString();
+          filter = `@filter(ge(dgraph.debug.timestamp, "${startIso}"))`;
+        } else if (endVal) {
+          const endIso = new Date(endVal).toISOString();
+          filter = `@filter(le(dgraph.debug.timestamp, "${endIso}"))`;
+        }
+      } else {
+        let ms = 0;
+        switch (timeRange) {
+          case '1m':  ms = 1 * 60 * 1000; break;
+          case '5m':  ms = 5 * 60 * 1000; break;
+          case '15m': ms = 15 * 60 * 1000; break;
+          case '1h':  ms = 1 * 60 * 60 * 1000; break;
+          case '24h': ms = 24 * 60 * 60 * 1000; break;
+        }
+        const cutOff = new Date(Date.now() - ms).toISOString();
+        filter = `@filter(ge(dgraph.debug.timestamp, "${cutOff}"))`;
+      }
+
       const dql = `{
-        ops(func: type(dgraph.debug.Operation), orderdesc: dgraph.debug.timestamp, first: ${limit}) {
+        ops(func: type(dgraph.debug.Operation), orderdesc: dgraph.debug.timestamp${firstClause}) ${filter} {
           uid
           dgraph.debug.query
           dgraph.debug.mutation
@@ -388,7 +476,7 @@
       for (const g of map.values()) {
         const n = g.entries.length;
         g.count = n;
-        g.lastTimestamp = g.entries.reduce((latest, e) => e.timestamp > latest ? e.timestamp : latest, '');
+        g.timestamp = g.entries.reduce((latest, e) => e.timestamp > latest ? e.timestamp : latest, '');
         g.total    = Math.max(...g.entries.map(e => e.total));
         g.avgTotal = g.entries.reduce((s, e) => s + e.total, 0) / n;
         g.uids     = Math.max(...g.entries.map(e => e.uids));
@@ -443,8 +531,8 @@
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('count')">#<span id="sort-count"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('operation')">Op<span id="sort-operation"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('timestamp')">Time<span id="sort-timestamp"></span></div>
-          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('total')">Max<span id="sort-total"></span></div>
-          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('uids')">UIDs<span id="sort-uids"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('total')">Max Time<span id="sort-total"></span></div>
+          <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('uids')">Max UIDs<span id="sort-uids"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('diskReads')">Disk<span id="sort-diskReads"></span></div>
           <div class="cursor-pointer hover:text-white text-right" onclick="toggleSort('cacheRate')">Cache %<span id="sort-cacheRate"></span></div>
         </div>`;
@@ -507,7 +595,7 @@
         <div class="truncate font-mono text-xs text-gray-300" title="${esc(g.query)}">${esc(preview)}</div>
         <div class="text-right text-xs text-gray-400 font-semibold">${g.count}x</div>
         <div class="text-right ${opColor} text-xs">${g.operation}</div>
-        <div class="text-right text-xs text-gray-500">${fmtShortTime(g.lastTimestamp)}</div>
+        <div class="text-right text-xs text-gray-500">${fmtShortTime(g.timestamp)}</div>
         <div class="text-right font-mono text-xs ${latencyColor(g.total)}">${fmtDuration(g.total)}</div>
         <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.uids)}</div>
         <div class="text-right font-mono text-xs text-gray-400">${fmtNum(g.diskReads)}</div>
@@ -1064,6 +1152,7 @@ Please analyze this ${e.operation} and suggest optimizations to reduce latency a
     // Init
     renderHeader(false);
     updateSortIndicators();
+    onTimeRangeChange();
   </script>
 </body>
 </html>
