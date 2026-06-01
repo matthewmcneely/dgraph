@@ -689,7 +689,7 @@ var debugPredicateMap = map[string]struct{}{
 
 // IsDebugPredicate returns true if the predicate is a debug performance tracking predicate.
 func IsDebugPredicate(pred string) bool {
-	_, ok := debugPredicateMap[ParseAttr(pred)]
+	_, ok := debugPredicateMap[pred]
 	return ok
 }
 
