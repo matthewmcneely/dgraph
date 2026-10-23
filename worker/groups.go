@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+ * SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -1102,6 +1102,12 @@ func GetFeaturesList() []string {
 	var ee []string
 	if Config.AclSecretKey != nil {
 		ee = append(ee, "acl")
+	}
+	// Reported separately from ACL. These have historically been the same bit,
+	// which is already wrong for --limit shared-instance: that mode disables ACL
+	// for non-root namespaces while multi-tenancy stays on, yet still advertises
+	// both off the ACL key.
+	if x.MultiTenancyEnabled() {
 		ee = append(ee, "multi_tenancy")
 	}
 	if x.WorkerConfig.EncryptionKey != nil {

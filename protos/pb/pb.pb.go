@@ -1,5 +1,5 @@
 //
-// SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+// SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 // Style guide for Protocol Buffer 3.
@@ -4017,8 +4017,7 @@ type VectorIndexSpec struct {
 	unknownFields protoimpl.UnknownFields
 
 	// This names the kind of Vector Index, e.g.,
-	//
-	//	hnsw, lsh, hypertree, ...
+	//    hnsw, lsh, hypertree, ...
 	Name    string        `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	Options []*OptionPair `protobuf:"bytes,2,rep,name=options,proto3" json:"options,omitempty"`
 }

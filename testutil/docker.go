@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+ * SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -8,6 +8,7 @@ package testutil
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +22,6 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/dgraph-io/dgraph/v25/x"
 )

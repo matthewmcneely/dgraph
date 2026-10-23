@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+ * SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -317,7 +317,8 @@ func (c *LocalCluster) createContainer(dc dnode) (string, error) {
 		}
 	}
 
-	cconf := &container.Config{Cmd: cmd, Image: image, WorkingDir: dc.workingDir(), ExposedPorts: dc.ports()}
+	cconf := &container.Config{Cmd: cmd, Image: image, WorkingDir: dc.workingDir(),
+		ExposedPorts: dc.ports(), Env: dc.env(c)}
 	// ApplyContainerUser is a public hook in dgraphtest/hooks.go; the
 	// default is no-op. Downstream consumers that run dgraph as a
 	// non-root user inside the test container override it to set
@@ -863,23 +864,35 @@ func (c *LocalCluster) waitUntilLogin() error {
 }
 
 func (c *LocalCluster) waitUntilGraphqlHealthCheck() error {
+	// The probes below are admin GraphQL operations, and every admin GraphQL
+	// operation carries IpWhitelistingMW — login included. On a cluster whose
+	// whitelist does not admit this process, neither can ever succeed, so wait on
+	// /probe/graphql instead: no whitelist middleware, no auth, and its whole
+	// purpose is answering "is GraphQL serving yet".
+	if c.conf.whitelist != defaultWhitelist {
+		return c.waitUntilGraphqlProbe()
+	}
+
 	hc, err := c.HTTPClient()
 	if err != nil {
 		return errors.Wrap(err, "error creating http client while graphql health check")
 	}
 	if c.conf.acl {
-		for range 5 {
+		for attempt := range 10 {
 			if err = hc.LoginIntoNamespace(dgraphapi.DefaultUser, dgraphapi.DefaultPassword, x.RootNamespace); err == nil {
 				break
 			}
-			time.Sleep(1 * time.Second)
+			if attempt > 5 {
+				log.Printf("[WARNING] problem trying to login during graphql health check: %v", err)
+			}
+			time.Sleep(waitDurBeforeRetry)
 		}
 		if err != nil {
 			return errors.Wrap(err, "error during login while graphql health check")
 		}
 	}
 
-	for range 10 {
+	for attempt := range 10 {
 		// Sleep for a second before retrying
 		time.Sleep(waitDurBeforeRetry)
 		// we do this because before v21, we used to propose the initial schema to the cluster.
@@ -890,8 +903,38 @@ func (c *LocalCluster) waitUntilGraphqlHealthCheck() error {
 			log.Printf("[INFO] graphql health check succeeded for %v", c.conf.prefix)
 			return nil
 		}
+		if attempt > 5 {
+			log.Printf("[WARNING] problem during graphql health check: %v", err)
+		}
 	}
 	return errors.Wrap(err, "error during graphql health check")
+}
+
+// waitUntilGraphqlProbe waits for GraphQL to serve using /probe/graphql, which
+// carries no IP-whitelist and no auth middleware. It is the probe to use when the
+// cluster's whitelist may not admit the test process.
+func (c *LocalCluster) waitUntilGraphqlProbe() error {
+	url, err := c.serverURL("alpha", "/probe/graphql")
+	if err != nil {
+		return errors.Wrap(err, "error getting graphql probe URL")
+	}
+
+	var lastErr error
+	for attempt := range 10 {
+		time.Sleep(waitDurBeforeRetry)
+		req, err := http.NewRequest(http.MethodGet, "http://"+url, nil)
+		if err != nil {
+			return errors.Wrap(err, "error building graphql probe request")
+		}
+		if _, lastErr = dgraphapi.DoReq(req); lastErr == nil {
+			log.Printf("[INFO] graphql probe succeeded for %v", c.conf.prefix)
+			return nil
+		}
+		if attempt > 5 {
+			log.Printf("[WARNING] problem during graphql probe: %v", lastErr)
+		}
+	}
+	return errors.Wrap(lastErr, "error during graphql probe")
 }
 
 // Upgrades the cluster to the provided dgraph version
@@ -1083,7 +1126,12 @@ func (c *LocalCluster) HTTPClient() (*dgraphapi.HTTPClient, error) {
 		return nil, err
 	}
 
-	return dgraphapi.GetHttpClient(alphaUrl, zeroUrl)
+	hc, err := dgraphapi.GetHttpClient(alphaUrl, zeroUrl)
+	if err != nil {
+		return nil, err
+	}
+	hc.AuthToken = c.conf.securityToken
+	return hc, nil
 }
 
 func (c *LocalCluster) GetAlphaHttpClient(alphaID int) (*dgraphapi.HTTPClient, error) {

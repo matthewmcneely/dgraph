@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+ * SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 package alpha
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -26,11 +25,9 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/zpages"
-	"golang.org/x/net/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	_ "google.golang.org/grpc/encoding/gzip" // grpc compression
@@ -176,7 +173,19 @@ they form a Raft group and provide synchronous replication.
 			"A comma separated list of IP addresses, IP ranges, CIDR blocks, or hostnames you wish "+
 				"to whitelist for performing admin actions (i.e., --security "+
 				`"whitelist=144.142.126.254,127.0.0.1:127.0.0.3,192.168.0.0/16,host.docker.`+
-				`internal").`).
+				`internal"). Empty by default, which admits loopback only. This is a network `+
+				"location check, NOT authentication: every address in the range can run "+
+				"privileged operations without a credential unless you also set token= or enable "+
+				"ACL.").
+		Flag("anonymous",
+			"[full, data, none] What a caller that presents no verified credential may do. "+
+				"full (default) leaves authorization to whatever the whitelist, token, and ACL "+
+				"settings decide, which is the behavior of every earlier release. data allows "+
+				"queries, mutations, commits, and login while denying every administrative "+
+				"operation, including schema changes and drops, regardless of the whitelist. "+
+				"none additionally denies queries, "+
+				"mutations, and commits, leaving only login and the health endpoints. data and "+
+				"none require token= or ACL, otherwise no caller can ever be identified.").
 		String())
 
 	flag.String("limit", worker.LimitDefaults, z.NewSuperFlagHelp(worker.LimitDefaults).
@@ -279,6 +288,8 @@ they form a Raft group and provide synchronous replication.
 			"separately from variables/args so identical queries can be identified regardless of "+
 			"arguments. Disabled by default.").
 		String())
+
+	RegisterFlags(flag)
 }
 
 func setupCustomTokenizers() {
@@ -296,70 +307,7 @@ func setupCustomTokenizers() {
 //
 // e.g. "144.142.126.222:144.142.126.244,144.142.126.254,192.168.0.0/16,host.docker.internal"
 func getIPsFromString(str string) ([]x.IPRange, error) {
-	if str == "" {
-		return []x.IPRange{}, nil
-	}
-
-	var ipRanges []x.IPRange
-	rangeStrings := strings.Split(str, ",")
-
-	for _, s := range rangeStrings {
-		isIPv6 := strings.Contains(s, "::")
-		tuple := strings.Split(s, ":")
-		switch {
-		case isIPv6 || len(tuple) == 1:
-			if !strings.Contains(s, "/") {
-				// string is hostname like host.docker.internal,
-				// or IPv4 address like 144.124.126.254,
-				// or IPv6 address like fd03:b188:0f3c:9ec4::babe:face
-				ipAddr := net.ParseIP(s)
-				if ipAddr != nil {
-					ipRanges = append(ipRanges, x.IPRange{Lower: ipAddr, Upper: ipAddr})
-				} else {
-					ipAddrs, err := net.LookupIP(s)
-					if err != nil {
-						return nil, errors.Errorf("invalid IP address or hostname: %s", s)
-					}
-
-					for _, addr := range ipAddrs {
-						ipRanges = append(ipRanges, x.IPRange{Lower: addr, Upper: addr})
-					}
-				}
-			} else {
-				// string is CIDR block like 192.168.0.0/16 or fd03:b188:0f3c:9ec4::/64
-				rangeLo, network, err := net.ParseCIDR(s)
-				if err != nil {
-					return nil, errors.Errorf("invalid CIDR block: %s", s)
-				}
-
-				addrLen, maskLen := len(rangeLo), len(network.Mask)
-				rangeHi := make(net.IP, len(rangeLo))
-				copy(rangeHi, rangeLo)
-				for i := 1; i <= maskLen; i++ {
-					rangeHi[addrLen-i] |= ^network.Mask[maskLen-i]
-				}
-
-				ipRanges = append(ipRanges, x.IPRange{Lower: rangeLo, Upper: rangeHi})
-			}
-		case len(tuple) == 2:
-			// string is range like a.b.c.d:w.x.y.z
-			rangeLo := net.ParseIP(tuple[0])
-			rangeHi := net.ParseIP(tuple[1])
-			switch {
-			case rangeLo == nil:
-				return nil, errors.Errorf("invalid IP address: %s", tuple[0])
-			case rangeHi == nil:
-				return nil, errors.Errorf("invalid IP address: %s", tuple[1])
-			case bytes.Compare(rangeLo, rangeHi) > 0:
-				return nil, errors.Errorf("inverted IP address range: %s", s)
-			}
-			ipRanges = append(ipRanges, x.IPRange{Lower: rangeLo, Upper: rangeHi})
-		default:
-			return nil, errors.Errorf("invalid IP address range: %s", s)
-		}
-	}
-
-	return ipRanges, nil
+	return x.GetIPsFromString(str)
 }
 
 func httpPort() int {
@@ -378,7 +326,10 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
-		ctx := x.AttachAccessJwt(context.Background(), r)
+		// Full identity, not just the access JWT: Health(all) is a capability check,
+		// and under a closed --security "anonymous=..." posture a caller presenting
+		// only the --security token would otherwise arrive unidentified.
+		ctx := x.AttachRequestIdentity(context.Background(), r)
 		var resp *api.Response
 		if resp, err = (&edgraph.Server{}).Health(ctx, true); err != nil {
 			x.SetStatus(w, x.Error, err.Error())
@@ -423,8 +374,9 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	x.AddCorsHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 
-	ctx := context.Background()
-	ctx = x.AttachAccessJwt(ctx, r)
+	// Full identity, not just the access JWT: State is a capability check. See the
+	// note on the /health?all branch above.
+	ctx := x.AttachRequestIdentity(context.Background(), r)
 
 	var aResp *api.Response
 	if aResp, err = (&edgraph.Server{}).State(ctx); err != nil {
@@ -460,12 +412,26 @@ func serveGRPC(l net.Listener, tlsCfg *tls.Config, closer *z.Closer) {
 
 	x.RegisterExporters(Alpha.Conf, "dgraph.alpha")
 
+	// Identity resolution runs first so every later interceptor and handler sees
+	// the same verified Principal instead of re-parsing the credential. It never
+	// rejects — see x.WithResolvedIdentity — so ordering it ahead of audit cannot
+	// suppress an audit record.
+	unary := []grpc.UnaryServerInterceptor{x.IdentityUnaryInterceptor(), audit.AuditRequestGRPC}
+	if zi := ZanzibarUnaryInterceptor(); zi != nil {
+		unary = append(unary, zi)
+	}
+	stream := []grpc.StreamServerInterceptor{x.IdentityStreamInterceptor(), audit.AuditStreamGRPC}
+	if zs := ZanzibarStreamInterceptor(); zs != nil {
+		stream = append(stream, zs)
+	}
+
 	opt := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(x.GrpcMaxSize),
 		grpc.MaxSendMsgSize(x.GrpcMaxSize),
 		grpc.MaxConcurrentStreams(1000),
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.UnaryInterceptor(audit.AuditRequestGRPC),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
 	}
 	if tlsCfg != nil {
 		tlsCfg.NextProtos = []string{"h2"}
@@ -476,6 +442,7 @@ func serveGRPC(l net.Listener, tlsCfg *tls.Config, closer *z.Closer) {
 	api.RegisterDgraphServer(s, &edgraph.Server{})
 	hapi.RegisterHealthServer(s, health.NewServer())
 	worker.RegisterZeroProxyServer(s)
+	RegisterZanzibar(s)
 
 	err := s.Serve(l)
 	glog.Errorf("GRPC listener canceled: %v\n", err)
@@ -578,7 +545,22 @@ func setupServer(closer *z.Closer, enableMcp bool) {
 	mainServer, adminServer, gqlHealthStore = admin.NewServers(introspection,
 		globalEpoch, closer)
 	baseMux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
-		namespace := x.ExtractNamespaceHTTP(r)
+		// Strict here because this handler routes by the resolved namespace: it sets
+		// the resolver header that selects which namespace's GraphQL schema serves
+		// the request, so a token it cannot resolve must be refused rather than
+		// quietly served the root namespace's. A request with no token still
+		// resolves to the root namespace — see x.ResolveTenantHTTPStrict.
+		//
+		// Two limits, neither of which this closes. The strict variant only rejects a
+		// token that was *presented* and could not be resolved, and its "was one
+		// presented" probe reads the ACL accessJwt channel, so an installed
+		// non-ACL resolver is not covered. And the graphql-ws subscription handler
+		// routes by the same header while still using the lenient resolver.
+		namespace, err := x.ResolveTenantHTTPStrict(r)
+		if err != nil {
+			admin.WriteErrorResponse(w, r, err)
+			return
+		}
 		r.Header.Set("resolver", strconv.FormatUint(namespace, 10))
 		if err := admin.LazyLoadSchema(namespace); err != nil {
 			admin.WriteErrorResponse(w, r, err)
@@ -593,7 +575,12 @@ func setupServer(closer *z.Closer, enableMcp bool) {
 		r.Header.Set("resolver", "0")
 		// We don't need to load the schema for all the admin operations.
 		// Only a few like getUser, queryGroup require this. So, this can be optimized.
-		if err := admin.LazyLoadSchema(x.ExtractNamespaceHTTP(r)); err != nil {
+		namespace, err := x.ResolveTenantHTTP(r)
+		if err != nil {
+			admin.WriteErrorResponse(w, r, err)
+			return
+		}
+		if err := admin.LazyLoadSchema(namespace); err != nil {
 			admin.WriteErrorResponse(w, r, err)
 			return
 		}
@@ -686,6 +673,8 @@ func run() {
 		FromSuperFlag(Alpha.Conf.GetString("badger"))
 	security := z.NewSuperFlag(Alpha.Conf.GetString("security")).MergeAndCheckDefault(
 		worker.SecurityDefaults)
+	anonymous, err := x.ParseAnonymousPosture(security.GetString("anonymous"))
+	x.Check(err)
 	conf := audit.GetAuditConf(Alpha.Conf.GetString("audit"))
 
 	x.Config.Limit = z.NewSuperFlag(Alpha.Conf.GetString("limit")).MergeAndCheckDefault(
@@ -754,6 +743,7 @@ func run() {
 		AbortOlderThan:      abortDur,
 		StartTime:           startTime,
 		Security:            security,
+		Anonymous:           anonymous,
 		TLSClientConfig:     tlsClientConf,
 		TLSServerConfig:     tlsServerConf,
 		AclJwtAlg:           keys.AclJwtAlg,
@@ -763,6 +753,21 @@ func run() {
 	}
 	x.WorkerConfig.Parse(Alpha.Conf)
 
+	// The built-in authenticator: ACL's access JWT, plus the --security auth token as
+	// an identity rather than a boolean check. Installed before ConfigureIdentity so a
+	// deployment can compose with or replace it; see edgraph.PresharedAuthenticator.
+	x.SetAuthenticator(edgraph.PresharedAuthenticator())
+
+	// Install deployment-specific authentication and authorization now: the config
+	// is parsed, and nothing is serving yet. A misconfiguration here is fatal, which
+	// is why it runs before any listener rather than lazily on the first request.
+	ConfigureIdentity()
+
+	// The --security "anonymous=..." floor goes on last, so that it wraps whatever
+	// policy ConfigureIdentity installed rather than being replaced by it. Under the
+	// shipped anonymous=full this installs nothing.
+	edgraph.EnforceAnonymousPosture(anonymous)
+
 	// Set the directory for temporary buffers.
 	z.SetTmpDir(x.WorkerConfig.TmpDir)
 
@@ -770,6 +775,15 @@ func run() {
 
 	setupCustomTokenizers()
 	x.Config.PortOffset = Alpha.Conf.GetInt("port_offset")
+
+	// Deliberately this late. It has to follow ConfigureIdentity, because a
+	// deployment authenticator changes who can be identified, and it has to follow
+	// the port offset, because the warning names the HTTP port.
+	builtinIdentity := x.AuthenticatorName() == edgraph.PresharedAuthenticator().Name()
+	for _, msg := range securityWarnings(anonymous, security.GetString("whitelist"), ips,
+		opts.AuthToken, keys.AclSecretKey != nil, builtinIdentity, httpPort()) {
+		glog.Warning(msg)
+	}
 	x.Config.LimitMutationsNquad = int(x.Config.Limit.GetInt64("mutations-nquad"))
 	x.Config.LimitQueryEdge = x.Config.Limit.GetUint64("query-edge")
 	x.Config.BlockClusterWideDrop = x.Config.Limit.GetBool("disallow-drop")
@@ -810,13 +824,6 @@ func run() {
 
 	worker.InitServerState()
 	worker.InitTasks()
-
-	if Alpha.Conf.GetBool("expose_trace") {
-		// TODO: Remove this once we get rid of event logs.
-		trace.AuthRequest = func(req *http.Request) (any, sensitive bool) {
-			return true, true
-		}
-	}
 
 	// Posting will initialize index which requires schema. Hence, initialize
 	// schema before calling posting.Init().

@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+# SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
 
@@ -54,7 +54,7 @@ regenerate:
 	@echo "Running in Docker..."
 	@docker run --rm -v $(shell pwd)/..:/go/src/github.com/dgraph-io/dgraph \
 		-w /go/src/github.com/dgraph-io/dgraph/protos \
-		golang:1.25.0 \
+		golang:1.27.0 \
 		/bin/bash -c "apt-get update && apt-get install -y protobuf-compiler && make regenerate"
 else
 .PHONY: regenerate

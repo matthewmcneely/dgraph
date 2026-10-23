@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+ * SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -501,7 +501,12 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) (
 		return
 	}
 
-	ctx = x.AttachJWTNamespace(ctx)
+	ctx, err = x.ResolveTenant(ctx)
+	if err != nil {
+		resp.Errors = schema.AsGQLErrors(err)
+		return
+	}
+
 	op, err := r.schema.Operation(gqlReq)
 	if err != nil {
 		resp.Errors = schema.AsGQLErrors(err)

@@ -6,6 +6,244 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/). 
 to [Semantic Versioning](https://semver.org). When adding a new entry, please use the entries below
 as a guide.
 
+## [v25.5.0] - 2026-10-14
+
+[v25.5.0]: https://github.com/dgraph-io/dgraph/compare/v25.4.1...v25.5.0
+
+- **Added**
+
+- **Zero**
+  - feat(zero): allow `--rebalance_interval=0` to disable automatic tablet rebalancing (#9848).
+    Positive values and the 8-minute default are unchanged. The flag must be set on every Zero in
+    the ensemble, and a Zero restarted without it reverts to the default. Manual moves via
+    `/moveTablet` keep working while automatic rebalancing is disabled.
+
+- **Bulk Loader**
+  - feat(bulk): deterministic initial tablet placement via `--tablet_placement` (#9842). An opt-in
+    JSON file pins predicates to groups so a cluster bootstrapped from bulk output starts with an
+    operator-chosen tablet layout. Placement is applied at load time only; Zero's rebalancer may
+    later move tablets unless it is disabled with `--rebalance_interval=0`.
+
+- **Security**
+  - feat(security): add a `--security "anonymous=full|data|none"` posture (#9844). It states what a
+    caller with no verified credential may do. The default is `full`, which is the behavior of every
+    earlier release, so existing clusters are unchanged. Zero honors the same key.
+
+- **Core**
+  - feat(edgraph): add an AccessController and separate identity from tenancy (#9813). Behavior with
+    no resolver, authenticator, or capability source installed is unchanged. Deliberate changes:
+    `authSuperAdmin` returns `Unauthenticated` when the namespace claim cannot be parsed instead of
+    continuing as namespace 0, and `/health` reports `multi_tenancy` separately from `acl`. The
+    exported `x.AttachJWTNamespace`, `x.AttachJWTNamespaceOutgoing`, and `x.ExtractNamespaceHTTP`
+    are replaced by variants that return an error.
+
+- **Fixed**
+
+- **Query**
+  - fix(query): avoid eager UID materialization on posting reads (#9809)
+
+    > **WARNING** `first: -N` now returns different results for a query whose index is lossy (for
+    > example `term`) or whose per-token posting lists are intersected. The worker no longer trims
+    > the posting list before the post-filter runs, so the last N rows are taken from the filtered
+    > result. The previous answer was wrong rather than merely different.
+
+- **Core**
+  - fix(unique): include language in value identity (#9820). For predicates with both `@unique` and
+    `@lang`, equal values under different language tags in one mutation are no longer rejected as
+    duplicates, matching the database-level uniqueness check.
+
+- **Changed**
+
+- **Core**
+  - chore(core): remove net/trace event log (#9593). The `/debug/requests` and `/debug/events`
+    endpoints are removed.
+
+    > **WARNING** `--expose_trace` is deprecated. It is still accepted and prints a deprecation
+    > notice; a future release will reject it. Remove it from startup flags and compose files.
+
+- **Performance**
+  - perf(unique): make verifyUniqueWithinMutation linear (#9822). The in-request duplicate check for
+    `@unique` predicates was quadratic in the number of edges per mutation; one check took 1.67s at
+    8,000 edges. It is now a single pass (585us at 8,000 edges).
+
+- **Chore**
+  - chore(test): pull MinIO test images from an org-owned ghcr mirror (#9843)
+  - chore(test): pull MinIO test images from quay.io instead of Docker Hub (#9832)
+  - docs: fix typo neccessary -> necessary (#9819)
+
+- **Dependency Updates**
+  - chore(deps): bump badger from v4.9.4 to v4.9.6 (fixes the compaction regression in
+    dgraph-io/badger#2327)
+  - chore(deps): bump google.golang.org/grpc from 1.82.1 to 1.83.2 (#9821, #9828)
+  - deps: upgrade golang.org/x/crypto to v0.55.0 (#9826)
+  - chore(deps): bump go.opentelemetry.io/otel/sdk from 1.44.0 to 1.45.0 (#9835)
+  - chore(deps): bump go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp from 1.44.0 to
+    1.45.0 (#9833)
+
+- **Security**
+  - grpc 1.83.1 and 1.83.2 carry upstream security fixes. 1.83.1 addresses GHSA-vp52-pcj8-j9qc /
+    CVE-2026-84304, a heap memory exhaustion via HTTP/2 DATA frame fragmentation that affects
+    grpc-go 1.83.0 and earlier, including the 1.82.1 shipped in v25.4.x; it also rejects nested
+    xds/rbac `Principal` and `Permission` rules with `:scheme` or `grpc-` prefixed header matchers.
+    1.83.2 rejects requests missing both `:authority` and `Host` headers with HTTP 400.
+
+## [v25.4.1] - 2026-08-24
+
+[v25.4.1]: https://github.com/dgraph-io/dgraph/compare/v25.4.0...v25.4.1
+
+- **Fixed**
+
+- **Core**
+  - fix(posting): make rollup failures diagnosable in logs (#9808). The warning logged when a rollup
+    fails had its format arguments reversed and printed the key as a decimal byte slice. It now
+    prints the error and a hex key that can be passed to `dgraph debug --lookup`.
+
+- **Chore**
+  - chore: upgrade Go to 1.27.0 (#9816)
+
+## [v25.4.0] - 2026-07-30
+
+[v25.4.0]: https://github.com/dgraph-io/dgraph/compare/v25.3.8...v25.4.0
+
+- **Added**
+
+- **Zero**
+  - Zero now accepts a `--security` superflag (`token=...;whitelist=...`), matching Alpha's, and
+    authorizes its administrative HTTP endpoints against it.
+
+    > **WARNING** Zero's admin HTTP endpoints (default port 6080) previously had no authentication.
+    > `/removeNode` and `/moveTablet` are now always guarded: without a configured token or
+    > whitelist, only loopback callers are admitted. `/state` and `/assign` keep their previous
+    > behavior until a token or whitelist is configured, at which point they are enforced too.
+    > Operators driving these endpoints remotely must set `--security "whitelist=...;token=..."` on
+    > Zero.
+
+- **Fixed**
+
+- **Core**
+  - fix(posting): don't serve calculatedUids to reads below their compute ts (#9801)
+
+- **Zero**
+  - fix(zero): size-aware predicate move timeout and rebalancer backoff (#9792)
+
+    > **WARNING** In #9792, the predicate move timeout is no longer a fixed two hours. It scales
+    > with tablet size (at least 256 KiB/s of budget, floored at the previous 2h), and a tablet
+    > whose move fails now sits out an escalating cooldown (1h doubling to 24h) before the
+    > auto-rebalancer will pick it again. Manual moves via `/moveTablet` bypass the cooldown.
+
+- **Backup**
+  - fix(backup): contain restore file paths within the handler root (#9760)
+
+- **Chore**
+  - chore: bump SPDX copyright headers from 2025 to 2026 (#9709)
+  - chore: upgrade Go to 1.26.5 (#9797)
+  - chore: add three published CVEs to openvex.json (#9787)
+  - chore(test): configure Zero security whitelist in test clusters (#9788)
+  - chore(ci): update ci-dgraph-load-tests.yml (#9800)
+
+- **Dependency Updates**
+  - chore(deps): bump github.com/dgraph-io/gqlgen to v1.0.0 (#9802)
+  - chore(deps): bump google.golang.org/grpc from 1.80.0 to 1.82.1 (#9789)
+  - chore(deps): bump go.opentelemetry.io/otel from 1.43.0 to 1.44.0 (#9799)
+  - chore(deps): bump golang.org/x/text from 0.37.0 to 0.39.0 (#9798)
+  - chore(deps): bump github.com/klauspost/compress from 1.18.5 to 1.18.7 (#9796)
+
+- **Security**
+  - Address GHSA-qj98-gp63-54xj — unauthenticated Zero admin HTTP endpoints allowed a control-plane
+    denial of service via `/removeNode`. See the Zero `--security` note above.
+  - #9760 also closes a path-traversal read: a manifest whose `path` escaped the handler root
+    steered restore file operations outside the backup location.
+  - #9802 removes 17 transitive modules from `go.sum`, including the unreachable
+    `github.com/go-chi/chi v3.3.2+incompatible` that scanners flagged as CWE-346.
+
+## [v25.3.8] - 2026-07-08
+
+[v25.3.8]: https://github.com/dgraph-io/dgraph/compare/v25.3.7...v25.3.8
+
+- **Fixed**
+  - fix(graphql): quote regexp filter values that aren't well-formed `/pattern/flags` literals
+    instead of passing them into generated DQL verbatim
+
+- **Chore**
+  - chore: add abstraction for worker operations (#9578)
+  - add stale action (#9759)
+
+- **Dependency Updates**
+  - chore(deps): bump badger to v4.9.4 and ristretto to v2.4.2 (#9771)
+
+- **Security**
+  - Address GHSA-33p8-wc97-5qcj / CVE-2026-63637 — DQL injection via the unvalidated GraphQL
+    `regexp` filter argument, exploitable unauthenticated in the default configuration.
+
+## [v25.3.7] - 2026-06-25
+
+[v25.3.7]: https://github.com/dgraph-io/dgraph/compare/v25.3.6...v25.3.7
+
+- **Security**
+  - fix(security): bump golang.org/x/crypto and x/net for HIGH CVEs (#9763)
+    - `golang.org/x/crypto` v0.50.0 → v0.52.0: CVE-2026-39827, CVE-2026-39828, CVE-2026-39829,
+      CVE-2026-39830, CVE-2026-39835, CVE-2026-42508, CVE-2026-46595, CVE-2026-46597
+    - `golang.org/x/net` v0.53.0 → v0.55.0: CVE-2026-25680, CVE-2026-25681, CVE-2026-27136,
+      CVE-2026-39821, CVE-2026-42502, CVE-2026-42506
+
+## [v25.3.6] - 2026-06-19
+
+[v25.3.6]: https://github.com/dgraph-io/dgraph/compare/v25.3.5...v25.3.6
+
+- **Added**
+
+- **Extensibility**
+  - alpha: add public extensibility hooks for the gRPC server and CLI flags (#9742)
+  - x,edgraph,worker: add a reserved-namespace plugin registry (#9753)
+  - edgraph: add AlterNoAuth for trusted in-process schema callers (#9748)
+
+- **Test**
+  - dgraphtest: add WithStartupArg for arbitrary Alpha flags (#9741)
+
+- **Fixed**
+  - fix: S390x compatibility (#9746)
+  - fix(security): compare poorman's auth token in constant time (#9736)
+  - x,edgraph: harden reserved-namespace registration and value-lock delete coverage (#9754)
+
+- **Changed**
+
+- **Build**
+  - build(jemalloc): patch jemalloc 5.3.1 source for libstdc++ 16+ ABI removal (#9740)
+
+- **Chore**
+  - test: poll for HNSW index readiness instead of fixed sleeps (#9739)
+  - test: align GraphQL health check retries with gRPC pattern (#9752)
+  - ci: remove labeler and simplify change detection (#9751)
+  - ci(cd-dgraph): drop badger artifact download from release
+  - ci(cd-dgraph): fix release asset paths after badger removal
+
+- **New Contributors**
+  - @navaneeswar1011 made their first contribution in #9746
+  - @alhudz made their first contribution in #9736
+
+## [v25.3.5] - 2026-06-11
+
+[v25.3.5]: https://github.com/dgraph-io/dgraph/compare/v25.3.4...v25.3.5
+
+- **Added**
+  - feat: buildvars registry + extension hooks + FIPS-awareness + test-infra resilience (#9691)
+
+- **Fixed**
+  - fix(backup): reject incremental backups whose read_ts has regressed (#9707)
+
+- **Chore**
+  - chore(deps): Upgrade go 1.26.4; add an openvex for false positive CVE report (#9735)
+  - chore: remove unused buildvars.ComposeBuildDir Var (#9704)
+  - chore(ci): disable scheduled jepsen test runs (#9729)
+  - docs(changelog): backfill v25.3.1-v25.3.4 and v24.1.6-v24.1.9 entries (#9705)
+
+- **Security**
+  - Address GHSA-rrwh-6jrq-wp5v / CVE-2026-54061 — Alpha exposed the external-snapshot import RPCs
+    on the public gRPC port with no authorization and no arming requirement, letting an
+    unauthenticated client wipe a group's store. The RPCs are now authorized, import mode must be
+    armed before any destructive work, and Badger's `Prepare()`/`dropAll()` is deferred until the
+    first valid data packet.
+
 ## [v25.3.4] - 2026-05-11
 
 [v25.3.4]: https://github.com/dgraph-io/dgraph/compare/v25.3.3...v25.3.4

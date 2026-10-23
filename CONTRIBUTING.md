@@ -30,7 +30,7 @@
   available through your OS package manager)
 - Install [Docker](https://docs.docker.com/install/) and
   [Docker Compose](https://docs.docker.com/compose/install/).
-- [Install Go 1.24.3 or above](https://golang.org/doc/install).
+- [Install Go 1.27.0 or above](https://golang.org/doc/install).
 - Install
   [trunk](https://docs.trunk.io/code-quality/overview/getting-started/install#install-the-launcher).
   Our CI uses trunk to lint and check code, having it installed locally will save you time.
@@ -214,7 +214,7 @@ under the Apache 2.0 license:
 
 ```sh
 /*
- * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+ * SPDX-FileCopyrightText: © 2017-2026 Istari Digital, Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
 ```
